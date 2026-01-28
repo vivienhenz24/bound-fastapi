@@ -9,6 +9,15 @@ class Settings(BaseSettings):
     # Database
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/bound"
 
+    # JWT Auth
+    jwt_secret_key: str
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 30
+    refresh_token_expire_days: int = 7
+
+    # CORS
+    frontend_url: str = "http://localhost:3000"
+
     # AWS S3
     aws_region: str = "us-east-1"
     s3_bucket_name: str = ""
