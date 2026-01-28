@@ -1,0 +1,91 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: PostgreSQL RDS instance for bound-fastapi
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+
+  DBName:
+    Type: String
+    Default: bound
+
+  DBMasterUsername:
+    Type: String
+    Default: postgres
+    NoEcho: true
+
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+
+Resources:
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnets for RDS
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-PrivateSubnetA
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-PrivateSubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-db-subnet-group
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for RDS PostgreSQL
+      VpcId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !ImportValue
+            Fn::Sub: ${EnvironmentName}-ECSSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-db-sg
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub ${EnvironmentName}-bound-db
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: postgres
+      EngineVersion: "16"
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Ref DBMasterPassword
+      AllocatedStorage: 20
+      MaxAllocatedStorage: 100
+      StorageType: gp3
+      StorageEncrypted: true
+      MultiAZ: false
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      BackupRetentionPeriod: 7
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-bound-db
+
+Outputs:
+  DBEndpoint:
+    Value: !GetAtt DBInstance.Endpoint.Address
+    Export:
+      Name: !Sub ${EnvironmentName}-DBEndpoint
+
+  DBPort:
+    Value: !GetAtt DBInstance.Endpoint.Port
+    Export:
+      Name: !Sub ${EnvironmentName}-DBPort

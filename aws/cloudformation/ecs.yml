@@ -1,0 +1,226 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: ECS Fargate service for bound-fastapi
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+
+  ContainerImage:
+    Type: String
+    Description: Docker image URI (e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com/bound-fastapi:latest)
+
+  ContainerPort:
+    Type: Number
+    Default: 8000
+
+  DesiredCount:
+    Type: Number
+    Default: 2
+
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+
+Resources:
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${EnvironmentName}-bound-cluster
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ECS tasks
+      VpcId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ecs-sg
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ALB
+      VpcId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-alb-sg
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${EnvironmentName}-bound-alb
+      Subnets:
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-PublicSubnetA
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-PublicSubnetB
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-bound-alb
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${EnvironmentName}-bound-tg
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      VpcId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-VPCId
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-bound-execution-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-bound-task-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !ImportValue
+                    Fn::Sub: ${EnvironmentName}-StorageBucketArn
+                  - !Sub
+                    - ${BucketArn}/*
+                    - BucketArn: !ImportValue
+                        Fn::Sub: ${EnvironmentName}-StorageBucketArn
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${EnvironmentName}-bound
+      RetentionInDays: 30
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${EnvironmentName}-bound
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: bound-fastapi
+          Image: !Ref ContainerImage
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+          Environment:
+            - Name: DATABASE_URL
+              Value: !Sub
+                - postgresql+asyncpg://postgres:${DBPassword}@${DBHost}:5432/bound
+                - DBPassword: !Ref DBMasterPassword
+                  DBHost: !ImportValue
+                    Fn::Sub: ${EnvironmentName}-DBEndpoint
+            - Name: S3_BUCKET_NAME
+              Value: !ImportValue
+                Fn::Sub: ${EnvironmentName}-StorageBucket
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      ServiceName: !Sub ${EnvironmentName}-bound-service
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !ImportValue
+              Fn::Sub: ${EnvironmentName}-PrivateSubnetA
+            - !ImportValue
+              Fn::Sub: ${EnvironmentName}-PrivateSubnetB
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+      LoadBalancers:
+        - ContainerName: bound-fastapi
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref ALBTargetGroup
+
+Outputs:
+  ALBDNSName:
+    Value: !GetAtt ALB.DNSName
+    Export:
+      Name: !Sub ${EnvironmentName}-ALBDNSName
+
+  ECSSecurityGroup:
+    Value: !Ref ECSSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-ECSSecurityGroup
+
+  ClusterName:
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub ${EnvironmentName}-ClusterName
