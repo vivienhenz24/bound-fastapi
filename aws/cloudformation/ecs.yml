@@ -18,9 +18,28 @@ Parameters:
     Type: Number
     Default: 2
 
+  DeploymentControllerType:
+    Type: String
+    Default: CODE_DEPLOY
+    AllowedValues:
+      - CODE_DEPLOY
+      - ECS
+
   DBMasterPassword:
     Type: String
     NoEcho: true
+
+  AcmCertificateArn:
+    Type: String
+    Default: ""
+    Description: ACM certificate ARN for the ALB HTTPS listener
+
+  EnableHttpRedirect:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
 
   DatabaseUrlSecretArn:
     Type: String
@@ -50,6 +69,17 @@ Parameters:
     Type: String
     Default: "bound"
 
+  CookieDomain:
+    Type: String
+    Default: ""
+
+  CookieSecure:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+
   MinCapacity:
     Type: Number
     Default: 2
@@ -71,6 +101,8 @@ Conditions:
   HasJwtSecret: !Not [!Equals [!Ref JwtSecretArn, ""]]
   HasResendApiKey: !Not [!Equals [!Ref ResendApiKeyArn, ""]]
   HasResendFromEmail: !Not [!Equals [!Ref ResendFromEmailArn, ""]]
+  EnableHttpRedirectCondition: !Equals [!Ref EnableHttpRedirect, "true"]
+  UseCodeDeploy: !Equals [!Ref DeploymentControllerType, "CODE_DEPLOY"]
 
 Resources:
   ECSCluster:
@@ -163,11 +195,27 @@ Resources:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
       LoadBalancerArn: !Ref ALB
-      Port: 80
-      Protocol: HTTP
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref AcmCertificateArn
       DefaultActions:
         - Type: forward
           TargetGroupArn: !Ref BlueTargetGroup
+
+  ALBHttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: EnableHttpRedirectCondition
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: "443"
+            StatusCode: HTTP_301
 
   ALBTestListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
@@ -192,6 +240,26 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsManagerRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: "*"
+        - PolicyName: ECSExecSSM
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: "*"
 
   TaskRole:
     Type: AWS::IAM::Role
@@ -259,6 +327,10 @@ Resources:
               Value: !Ref FrontendUrl
             - Name: RESEND_FROM_NAME
               Value: !Ref ResendFromName
+            - Name: COOKIE_DOMAIN
+              Value: !Ref CookieDomain
+            - Name: COOKIE_SECURE
+              Value: !Ref CookieSecure
             # - Name: S3_BUCKET_NAME
             #   Value: !ImportValue
             #     Fn::Sub: ${EnvironmentName}-StorageBucket
@@ -301,7 +373,7 @@ Resources:
       TaskDefinition: !Ref TaskDefinition
       DesiredCount: !Ref DesiredCount
       DeploymentController:
-        Type: CODE_DEPLOY
+        Type: !Ref DeploymentControllerType
       LaunchType: FARGATE
       NetworkConfiguration:
         AwsvpcConfiguration:
@@ -333,16 +405,18 @@ Resources:
 
   ECSServiceScalingTarget:
     Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: ECSService
     Properties:
       MaxCapacity: !Ref MaxCapacity
       MinCapacity: !Ref MinCapacity
-      ResourceId: !Sub service/${ECSCluster}/${ECSService}
+      ResourceId: !Sub service/${EnvironmentName}-bound-cluster/${EnvironmentName}-bound-service
       RoleARN: !GetAtt AutoScalingRole.Arn
       ScalableDimension: ecs:service:DesiredCount
       ServiceNamespace: ecs
 
   ECSServiceScalingPolicy:
     Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    DependsOn: ECSServiceScalingTarget
     Properties:
       PolicyName: !Sub ${EnvironmentName}-bound-cpu-target
       PolicyType: TargetTrackingScaling
@@ -356,6 +430,7 @@ Resources:
 
   CodeDeployServiceRole:
     Type: AWS::IAM::Role
+    Condition: UseCodeDeploy
     Properties:
       RoleName: !Sub ${EnvironmentName}-bound-codedeploy-role
       AssumeRolePolicyDocument:
@@ -401,12 +476,18 @@ Resources:
 
   CodeDeployApplication:
     Type: AWS::CodeDeploy::Application
+    Condition: UseCodeDeploy
     Properties:
       ApplicationName: !Sub ${EnvironmentName}-bound
       ComputePlatform: ECS
 
   CodeDeployDeploymentGroup:
     Type: AWS::CodeDeploy::DeploymentGroup
+    Condition: UseCodeDeploy
+    DependsOn:
+      - ECSService
+      - ALBListener
+      - ALBTestListener
     Properties:
       ApplicationName: !Ref CodeDeployApplication
       DeploymentGroupName: !Sub ${EnvironmentName}-bound
@@ -425,8 +506,8 @@ Resources:
       LoadBalancerInfo:
         TargetGroupPairInfoList:
           - TargetGroups:
-              - Name: !Ref BlueTargetGroup
-              - Name: !Ref GreenTargetGroup
+              - Name: !GetAtt BlueTargetGroup.TargetGroupName
+              - Name: !GetAtt GreenTargetGroup.TargetGroupName
             ProdTrafficRoute:
               ListenerArns:
                 - !Ref ALBListener
@@ -434,8 +515,8 @@ Resources:
               ListenerArns:
                 - !Ref ALBTestListener
       ECSServices:
-        - ClusterName: !Ref ECSCluster
-          ServiceName: !Ref ECSService
+        - ClusterName: !Sub ${EnvironmentName}-bound-cluster
+          ServiceName: !Sub ${EnvironmentName}-bound-service
 
 Outputs:
   ALBDNSName:

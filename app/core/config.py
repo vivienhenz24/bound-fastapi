@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     # CORS
     frontend_url: str = "http://localhost:3000"
 
+    # Cookies
+    cookie_domain: str | None = None
+    cookie_secure: bool = False
+
     # Email (Resend)
     resend_api_key: str = ""
     resend_from_email: str = ""

@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 
 from fastapi import (
     APIRouter,
@@ -18,15 +19,14 @@ from app.core.security import (
     create_access_token,
     create_refresh_token,
     decode_token,
-    generate_verification_token,
     generate_token_hash,
+    generate_verification_token,
     get_password_hash,
     verify_password,
 )
 from app.db.session import get_db
 from app.models.refresh_token import RefreshToken
 from app.models.user import User
-from app.services.email import send_verification_email
 from app.schemas.auth import (
     MessageResponse,
     ResendVerificationRequest,
@@ -36,11 +36,31 @@ from app.schemas.auth import (
     UserResponse,
     VerifyEmailRequest,
 )
+from app.services.email import send_verification_email
 
 router = APIRouter()
 
 
-@router.post("/auth/register", response_model=MessageResponse, status_code=status.HTTP_201_CREATED)
+def _cookie_domain() -> str | None:
+    if settings.cookie_domain:
+        return settings.cookie_domain
+    host = urlparse(settings.frontend_url).hostname
+    if not host or host in {"localhost", "127.0.0.1"}:
+        return None
+    return f".{host.lstrip('.')}"
+
+
+def _cookie_secure() -> bool:
+    if settings.cookie_secure:
+        return True
+    return urlparse(settings.frontend_url).scheme == "https"
+
+
+@router.post(
+    "/auth/register",
+    response_model=MessageResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 async def register(
     user_data: UserCreate,
     background_tasks: BackgroundTasks,
@@ -90,7 +110,9 @@ async def register(
     await db.commit()
     await db.refresh(new_user)
 
-    background_tasks.add_task(send_verification_email, new_user.email, verification_token)
+    background_tasks.add_task(
+        send_verification_email, new_user.email, verification_token
+    )
 
     return MessageResponse(message="User registered successfully")
 
@@ -147,9 +169,10 @@ async def login(
         key="refresh_token",
         value=refresh_token,
         httponly=True,
-        secure=False,  # Set to True in production with HTTPS
+        secure=_cookie_secure(),
         samesite="lax",
-        max_age=7 * 24 * 60 * 60,  # 7 days in seconds
+        max_age=settings.refresh_token_expire_days * 24 * 60 * 60,
+        domain=_cookie_domain(),
     )
 
     return TokenResponse(access_token=access_token)
@@ -230,9 +253,10 @@ async def refresh_token(
         key="refresh_token",
         value=new_refresh_token,
         httponly=True,
-        secure=False,  # Set to True in production with HTTPS
+        secure=_cookie_secure(),
         samesite="lax",
-        max_age=7 * 24 * 60 * 60,  # 7 days in seconds
+        max_age=settings.refresh_token_expire_days * 24 * 60 * 60,
+        domain=_cookie_domain(),
     )
 
     return TokenResponse(access_token=access_token)
@@ -288,9 +312,13 @@ async def resend_verification(
             hours=settings.email_verification_token_expire_hours
         )
         await db.commit()
-        background_tasks.add_task(send_verification_email, user.email, verification_token)
+        background_tasks.add_task(
+            send_verification_email, user.email, verification_token
+        )
 
-    return MessageResponse(message="If the account exists, a verification email was sent.")
+    return MessageResponse(
+        message="If the account exists, a verification email was sent."
+    )
 
 
 @router.post("/auth/logout", response_model=MessageResponse)
@@ -315,7 +343,7 @@ async def logout(
     await db.commit()
 
     # Clear refresh token cookie
-    response.delete_cookie(key="refresh_token")
+    response.delete_cookie(key="refresh_token", domain=_cookie_domain())
 
     return MessageResponse(message="Logged out successfully")
 
