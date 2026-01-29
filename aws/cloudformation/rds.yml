@@ -24,6 +24,10 @@ Parameters:
     NoEcho: true
     MinLength: 8
 
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+
 Resources:
   DBSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
@@ -48,8 +52,7 @@ Resources:
         - IpProtocol: tcp
           FromPort: 5432
           ToPort: 5432
-          SourceSecurityGroupId: !ImportValue
-            Fn::Sub: ${EnvironmentName}-ECSSecurityGroup
+          CidrIp: !Ref VpcCidr
       Tags:
         - Key: Name
           Value: !Sub ${EnvironmentName}-db-sg

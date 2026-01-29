@@ -52,6 +52,22 @@ async def register(
     existing_user = result.scalar_one_or_none()
 
     if existing_user:
+        if not existing_user.is_verified:
+            verification_token = generate_verification_token()
+            existing_user.email_verification_token_hash = generate_token_hash(
+                verification_token
+            )
+            existing_user.email_verification_expires_at = datetime.utcnow() + timedelta(
+                hours=settings.email_verification_token_expire_hours
+            )
+            await db.commit()
+            background_tasks.add_task(
+                send_verification_email, existing_user.email, verification_token
+            )
+            return MessageResponse(
+                message="If the account exists, a verification email was sent."
+            )
+
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email already registered",
