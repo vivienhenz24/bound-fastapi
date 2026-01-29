@@ -36,5 +36,13 @@ class TokenRefresh(BaseModel):
     refresh_token: str
 
 
+class VerifyEmailRequest(BaseModel):
+    token: str = Field(..., min_length=10)
+
+
+class ResendVerificationRequest(BaseModel):
+    email: EmailStr
+
+
 class MessageResponse(BaseModel):
     message: str

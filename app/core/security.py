@@ -1,5 +1,8 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any
+import hashlib
+import hmac
+import secrets
 
 import bcrypt
 from jose import JWTError, jwt
@@ -68,4 +71,14 @@ def decode_token(token: str) -> dict[str, Any]:
 
 def generate_token_hash(token: str) -> str:
     """Generate a hash of the token for storage in database."""
-    return get_password_hash(token)
+    # Use HMAC-SHA256 to avoid bcrypt length limits and keep tokens irreversible.
+    return hmac.new(
+        settings.jwt_secret_key.encode("utf-8"),
+        token.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def generate_verification_token() -> str:
+    """Generate a random token for email verification."""
+    return secrets.token_urlsafe(32)

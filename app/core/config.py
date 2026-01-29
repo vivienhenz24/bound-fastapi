@@ -14,9 +14,15 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
     refresh_token_expire_days: int = 7
+    email_verification_token_expire_hours: int = 24
 
     # CORS
     frontend_url: str = "http://localhost:3000"
+
+    # Email (Resend)
+    resend_api_key: str = ""
+    resend_from_email: str = ""
+    resend_from_name: str = "bound"
 
     # AWS S3
     aws_region: str = "us-east-1"
@@ -24,7 +30,7 @@ class Settings(BaseSettings):
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
 
-    model_config = {"env_file": ".env", "extra": "ignore"}
+    model_config = {"env_file": ".env.local", "extra": "ignore"}
 
 
 settings = Settings()

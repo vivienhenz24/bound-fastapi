@@ -1,14 +1,24 @@
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Request,
+    Response,
+    status,
+)
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_active_user
+from app.core.config import settings
 from app.core.security import (
     create_access_token,
     create_refresh_token,
     decode_token,
+    generate_verification_token,
     generate_token_hash,
     get_password_hash,
     verify_password,
@@ -16,19 +26,26 @@ from app.core.security import (
 from app.db.session import get_db
 from app.models.refresh_token import RefreshToken
 from app.models.user import User
+from app.services.email import send_verification_email
 from app.schemas.auth import (
     MessageResponse,
+    ResendVerificationRequest,
     TokenResponse,
     UserCreate,
     UserLogin,
     UserResponse,
+    VerifyEmailRequest,
 )
 
 router = APIRouter()
 
 
 @router.post("/auth/register", response_model=MessageResponse, status_code=status.HTTP_201_CREATED)
-async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
+async def register(
+    user_data: UserCreate,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
     """Register a new user."""
     # Check if user already exists
     result = await db.execute(select(User).where(User.email == user_data.email))
@@ -42,16 +59,22 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
 
     # Create new user
     hashed_password = get_password_hash(user_data.password)
+    verification_token = generate_verification_token()
     new_user = User(
         email=user_data.email,
         hashed_password=hashed_password,
         first_name=user_data.first_name,
         last_name=user_data.last_name,
+        email_verification_token_hash=generate_token_hash(verification_token),
+        email_verification_expires_at=datetime.utcnow()
+        + timedelta(hours=settings.email_verification_token_expire_hours),
     )
 
     db.add(new_user)
     await db.commit()
     await db.refresh(new_user)
+
+    background_tasks.add_task(send_verification_email, new_user.email, verification_token)
 
     return MessageResponse(message="User registered successfully")
 
@@ -80,6 +103,12 @@ async def login(
             detail="User account is inactive",
         )
 
+    if not user.is_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Email not verified",
+        )
+
     # Create access token
     access_token = create_access_token(data={"sub": user.email})
 
@@ -91,7 +120,7 @@ async def login(
 
     refresh_token_record = RefreshToken(
         user_id=user.id,
-        token_hash=refresh_token,  # Store token directly for simplicity
+        token_hash=generate_token_hash(refresh_token),
         expires_at=expires_at,
     )
     db.add(refresh_token_record)
@@ -147,11 +176,14 @@ async def refresh_token(
         raise credentials_exception
 
     # Verify refresh token exists in database and is not revoked
+    refresh_token_hash = generate_token_hash(refresh_token)
     token_result = await db.execute(
         select(RefreshToken).where(
             RefreshToken.user_id == user.id,
             RefreshToken.revoked == False,  # noqa: E712
             RefreshToken.expires_at > datetime.now(),
+            (RefreshToken.token_hash == refresh_token_hash)
+            | (RefreshToken.token_hash == refresh_token),  # legacy raw tokens
         )
     )
     stored_token = token_result.scalar_one_or_none()
@@ -171,7 +203,7 @@ async def refresh_token(
 
     new_refresh_token_record = RefreshToken(
         user_id=user.id,
-        token_hash=new_refresh_token,  # Store token directly for simplicity
+        token_hash=generate_token_hash(new_refresh_token),
         expires_at=expires_at,
     )
     db.add(new_refresh_token_record)
@@ -188,6 +220,61 @@ async def refresh_token(
     )
 
     return TokenResponse(access_token=access_token)
+
+
+@router.post("/auth/verify-email", response_model=MessageResponse)
+async def verify_email(
+    payload: VerifyEmailRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Verify a user's email using a one-time token."""
+    token_hash = generate_token_hash(payload.token)
+    result = await db.execute(
+        select(User).where(User.email_verification_token_hash == token_hash)
+    )
+    user = result.scalar_one_or_none()
+
+    if not user or not user.email_verification_expires_at:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired verification token",
+        )
+
+    if user.email_verification_expires_at < datetime.utcnow():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired verification token",
+        )
+
+    if not user.is_verified:
+        user.is_verified = True
+        user.email_verification_token_hash = None
+        user.email_verification_expires_at = None
+        await db.commit()
+
+    return MessageResponse(message="Email verified successfully")
+
+
+@router.post("/auth/resend-verification", response_model=MessageResponse)
+async def resend_verification(
+    payload: ResendVerificationRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """Resend email verification link if user exists and isn't verified."""
+    result = await db.execute(select(User).where(User.email == payload.email))
+    user = result.scalar_one_or_none()
+
+    if user and not user.is_verified:
+        verification_token = generate_verification_token()
+        user.email_verification_token_hash = generate_token_hash(verification_token)
+        user.email_verification_expires_at = datetime.utcnow() + timedelta(
+            hours=settings.email_verification_token_expire_hours
+        )
+        await db.commit()
+        background_tasks.add_task(send_verification_email, user.email, verification_token)
+
+    return MessageResponse(message="If the account exists, a verification email was sent.")
 
 
 @router.post("/auth/logout", response_model=MessageResponse)
