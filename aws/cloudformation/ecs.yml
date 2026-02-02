@@ -63,7 +63,7 @@ Parameters:
 
   FrontendUrl:
     Type: String
-    Default: "https://example.com"
+    Default: "https://bound.sh"
 
   ResendFromName:
     Type: String

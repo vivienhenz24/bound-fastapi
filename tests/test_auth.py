@@ -1,4 +1,5 @@
 import asyncio
+from uuid import UUID
 
 from sqlalchemy import select
 
@@ -16,7 +17,7 @@ async def _get_user_by_email(async_session_maker, email: str) -> User | None:
         return result.scalar_one_or_none()
 
 
-async def _get_refresh_tokens(async_session_maker, user_id: int) -> list[RefreshToken]:
+async def _get_refresh_tokens(async_session_maker, user_id: UUID) -> list[RefreshToken]:
     async with async_session_maker() as session:
         result = await session.execute(
             select(RefreshToken).where(RefreshToken.user_id == user_id)
@@ -24,7 +25,7 @@ async def _get_refresh_tokens(async_session_maker, user_id: int) -> list[Refresh
         return list(result.scalars().all())
 
 
-async def _set_user_active(async_session_maker, user_id: int, active: bool) -> None:
+async def _set_user_active(async_session_maker, user_id: UUID, active: bool) -> None:
     async with async_session_maker() as session:
         result = await session.execute(select(User).where(User.id == user_id))
         user = result.scalar_one()
@@ -35,7 +36,12 @@ async def _set_user_active(async_session_maker, user_id: int, active: bool) -> N
 def _register_user(client, email="test@example.com", password="password123"):
     return client.post(
         "/auth/register",
-        json={"email": email, "password": password, "first_name": "Test", "last_name": "User"},
+        json={
+            "email": email,
+            "password": password,
+            "first_name": "Test",
+            "last_name": "User",
+        },
     )
 
 
@@ -142,4 +148,6 @@ def test_cors_preflight_allows_frontend_origin(client):
     )
 
     assert response.status_code == 200
-    assert response.headers.get("access-control-allow-origin") == "http://localhost:3000"
+    assert (
+        response.headers.get("access-control-allow-origin") == "http://localhost:3000"
+    )

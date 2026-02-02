@@ -1,0 +1,151 @@
+name: Rollback Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_definition_revision:
+        description: 'Task definition revision to rollback to (e.g., 42). Leave empty to rollback to previous revision.'
+        required: false
+        type: string
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
+
+jobs:
+  rollback:
+    name: Rollback to Previous Version
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Get current and target task definitions
+        id: get-task-defs
+        run: |
+          CURRENT_TASK_DEF=$(aws ecs describe-services \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --query 'services[0].taskDefinition' \
+            --output text)
+
+          CURRENT_REVISION=$(echo $CURRENT_TASK_DEF | awk -F':' '{print $NF}')
+          TASK_FAMILY="production-bound"
+
+          if [ -n "${{ github.event.inputs.task_definition_revision }}" ]; then
+            # Use specified revision
+            TARGET_REVISION="${{ github.event.inputs.task_definition_revision }}"
+            TARGET_TASK_DEF="$TASK_FAMILY:$TARGET_REVISION"
+          else
+            # Rollback to previous revision
+            TARGET_REVISION=$((CURRENT_REVISION - 1))
+            TARGET_TASK_DEF="$TASK_FAMILY:$TARGET_REVISION"
+          fi
+
+          echo "current-revision=$CURRENT_REVISION" >> $GITHUB_OUTPUT
+          echo "target-revision=$TARGET_REVISION" >> $GITHUB_OUTPUT
+          echo "target-task-def=$TARGET_TASK_DEF" >> $GITHUB_OUTPUT
+
+          echo "📊 Current revision: $CURRENT_REVISION"
+          echo "🔄 Target revision: $TARGET_REVISION"
+
+      - name: Verify target task definition exists
+        run: |
+          TARGET_TASK_DEF="${{ steps.get-task-defs.outputs.target-task-def }}"
+
+          if ! aws ecs describe-task-definition --task-definition $TARGET_TASK_DEF > /dev/null 2>&1; then
+            echo "❌ Task definition $TARGET_TASK_DEF does not exist"
+            exit 1
+          fi
+
+          echo "✅ Task definition $TARGET_TASK_DEF found"
+
+      - name: Confirm rollback
+        run: |
+          echo "⚠️  WARNING: You are about to rollback the deployment"
+          echo "Current revision: ${{ steps.get-task-defs.outputs.current-revision }}"
+          echo "Target revision: ${{ steps.get-task-defs.outputs.target-revision }}"
+          echo ""
+          echo "This will:"
+          echo "  1. Update ECS service to use the previous task definition"
+          echo "  2. NOT rollback database migrations (manual intervention may be needed)"
+          echo "  3. Wait for service to stabilize with old version"
+
+      - name: Update ECS service
+        run: |
+          TARGET_TASK_DEF="${{ steps.get-task-defs.outputs.target-task-def }}"
+
+          echo "🔄 Rolling back to $TARGET_TASK_DEF..."
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --task-definition $TARGET_TASK_DEF \
+            --force-new-deployment
+
+      - name: Wait for deployment to stabilize
+        run: |
+          echo "⏳ Waiting for service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE
+
+          echo "✅ Service stabilized"
+
+      - name: Verify rollback
+        run: |
+          CURRENT_TASK_DEF=$(aws ecs describe-services \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --query 'services[0].taskDefinition' \
+            --output text)
+
+          CURRENT_REVISION=$(echo $CURRENT_TASK_DEF | awk -F':' '{print $NF}')
+
+          echo "📊 Current revision after rollback: $CURRENT_REVISION"
+          echo "🎯 Expected revision: ${{ steps.get-task-defs.outputs.target-revision }}"
+
+          if [ "$CURRENT_REVISION" = "${{ steps.get-task-defs.outputs.target-revision }}" ]; then
+            echo "✅ Rollback successful!"
+          else
+            echo "❌ Rollback verification failed"
+            exit 1
+          fi
+
+      - name: Check service health
+        run: |
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names production-bound-alb \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+
+          echo "🌐 ALB DNS: $ALB_DNS"
+          echo "🔍 Testing health endpoint..."
+
+          sleep 30
+
+          for i in {1..5}; do
+            if curl -f -s "http://$ALB_DNS/health" > /dev/null; then
+              echo "✅ Health check passed after rollback!"
+              exit 0
+            fi
+            echo "⏳ Attempt $i failed, retrying..."
+            sleep 10
+          done
+
+          echo "⚠️ Health check did not pass"
+          exit 1
+
+      - name: Post-rollback notice
+        if: always()
+        run: |
+          echo "⚠️  IMPORTANT: Database migrations are NOT automatically rolled back"
+          echo "If the previous version is incompatible with current DB schema:"
+          echo "  1. Go to Actions > Run Database Migrations"
+          echo "  2. Select 'downgrade -1' to rollback the last migration"
+          echo "  3. Verify application functionality"

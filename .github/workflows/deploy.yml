@@ -1,0 +1,255 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # Allow manual triggers
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+  ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
+  CONTAINER_NAME: bound-fastapi
+
+jobs:
+  build:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.build-image.outputs.image }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Build Docker image
+          docker build -t $ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REPOSITORY:latest .
+
+          # Push both tags
+          docker push $ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REPOSITORY:latest
+
+          echo "image=$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "✅ Pushed image: $ECR_REPOSITORY:$IMAGE_TAG"
+
+  migrate:
+    name: Run Database Migrations
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Get current task definition
+        id: get-task-def
+        run: |
+          TASK_FAMILY="production-bound"
+          TASK_DEF_ARN=$(aws ecs describe-services \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --query 'services[0].taskDefinition' \
+            --output text)
+
+          aws ecs describe-task-definition \
+            --task-definition $TASK_DEF_ARN \
+            --query 'taskDefinition' > task-definition.json
+
+          echo "task-def-arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+
+      - name: Get VPC configuration
+        id: get-vpc
+        run: |
+          # Get subnets and security groups from the ECS service
+          VPC_CONFIG=$(aws ecs describe-services \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --query 'services[0].networkConfiguration.awsvpcConfiguration' \
+            --output json)
+
+          SUBNETS=$(echo $VPC_CONFIG | jq -r '.subnets | join(",")')
+          SECURITY_GROUPS=$(echo $VPC_CONFIG | jq -r '.securityGroups | join(",")')
+
+          echo "subnets=$SUBNETS" >> $GITHUB_OUTPUT
+          echo "security-groups=$SECURITY_GROUPS" >> $GITHUB_OUTPUT
+
+      - name: Run database migrations
+        id: run-migrations
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Run migration task
+          TASK_ARN=$(aws ecs run-task \
+            --cluster $ECS_CLUSTER \
+            --task-definition production-bound \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ steps.get-vpc.outputs.subnets }}],securityGroups=[${{ steps.get-vpc.outputs.security-groups }}],assignPublicIp=DISABLED}" \
+            --overrides '{
+              "containerOverrides": [{
+                "name": "'"$CONTAINER_NAME"'",
+                "command": ["uv", "run", "alembic", "upgrade", "head"]
+              }]
+            }' \
+            --query 'tasks[0].taskArn' \
+            --output text)
+
+          echo "task-arn=$TASK_ARN" >> $GITHUB_OUTPUT
+          echo "🚀 Started migration task: $TASK_ARN"
+
+      - name: Wait for migrations to complete
+        run: |
+          TASK_ARN="${{ steps.run-migrations.outputs.task-arn }}"
+
+          echo "⏳ Waiting for migration task to complete..."
+          aws ecs wait tasks-stopped \
+            --cluster $ECS_CLUSTER \
+            --tasks $TASK_ARN
+
+          # Check exit code
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster $ECS_CLUSTER \
+            --tasks $TASK_ARN \
+            --query 'tasks[0].containers[0].exitCode' \
+            --output text)
+
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "❌ Migration failed with exit code: $EXIT_CODE"
+
+            # Get logs for debugging
+            echo "📋 Fetching logs..."
+            TASK_ID=$(echo $TASK_ARN | awk -F'/' '{print $NF}')
+            aws logs tail /ecs/production-bound --since 10m --format short --filter-pattern "task/$TASK_ID" || true
+
+            exit 1
+          fi
+
+          echo "✅ Migrations completed successfully"
+
+  deploy:
+    name: Deploy to ECS
+    needs: [build, migrate]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition production-bound \
+            --query taskDefinition > task-definition.json
+
+      - name: Update task definition with new image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.build.outputs.image-tag }}
+
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Get deployment status
+        if: always()
+        run: |
+          DEPLOYMENT=$(aws ecs describe-services \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --query 'services[0].deployments[0]' \
+            --output json)
+
+          STATUS=$(echo $DEPLOYMENT | jq -r '.status')
+          DESIRED=$(echo $DEPLOYMENT | jq -r '.desiredCount')
+          RUNNING=$(echo $DEPLOYMENT | jq -r '.runningCount')
+
+          echo "📊 Deployment Status: $STATUS"
+          echo "📊 Desired: $DESIRED, Running: $RUNNING"
+
+          if [ "$STATUS" = "PRIMARY" ] && [ "$RUNNING" -eq "$DESIRED" ]; then
+            echo "✅ Deployment successful!"
+          else
+            echo "⚠️ Deployment may have issues"
+          fi
+
+      - name: Verify deployment
+        run: |
+          # Get ALB DNS name
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names production-bound-alb \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+
+          echo "🌐 ALB DNS: $ALB_DNS"
+          echo "🔍 Testing health endpoint..."
+
+          # Wait a bit for the new tasks to be healthy
+          sleep 30
+
+          # Test health endpoint (try a few times)
+          for i in {1..5}; do
+            if curl -f -s "http://$ALB_DNS/health" > /dev/null; then
+              echo "✅ Health check passed!"
+              exit 0
+            fi
+            echo "⏳ Attempt $i failed, retrying..."
+            sleep 10
+          done
+
+          echo "⚠️ Health check did not pass after 5 attempts"
+          exit 1
+
+  notify:
+    name: Notify Deployment Status
+    needs: [build, migrate, deploy]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Check deployment result
+        run: |
+          if [ "${{ needs.deploy.result }}" = "success" ]; then
+            echo "✅ Deployment completed successfully"
+            echo "🚀 New version deployed: ${{ github.sha }}"
+            echo "🔗 Commit: ${{ github.event.head_commit.message }}"
+          else
+            echo "❌ Deployment failed"
+            echo "Build: ${{ needs.build.result }}"
+            echo "Migrate: ${{ needs.migrate.result }}"
+            echo "Deploy: ${{ needs.deploy.result }}"
+            exit 1
+          fi

@@ -1,0 +1,111 @@
+name: Run Database Migrations
+
+on:
+  workflow_dispatch:
+    inputs:
+      migration_command:
+        description: 'Migration command to run'
+        required: true
+        default: 'upgrade head'
+        type: choice
+        options:
+          - upgrade head
+          - downgrade -1
+          - current
+          - history
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
+  CONTAINER_NAME: bound-fastapi
+
+jobs:
+  migrate:
+    name: Run Migration
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Get VPC configuration
+        id: get-vpc
+        run: |
+          VPC_CONFIG=$(aws ecs describe-services \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --query 'services[0].networkConfiguration.awsvpcConfiguration' \
+            --output json)
+
+          SUBNETS=$(echo $VPC_CONFIG | jq -r '.subnets | join(",")')
+          SECURITY_GROUPS=$(echo $VPC_CONFIG | jq -r '.securityGroups | join(",")')
+
+          echo "subnets=$SUBNETS" >> $GITHUB_OUTPUT
+          echo "security-groups=$SECURITY_GROUPS" >> $GITHUB_OUTPUT
+
+      - name: Run migration command
+        id: run-migration
+        run: |
+          MIGRATION_CMD="${{ github.event.inputs.migration_command }}"
+          echo "🚀 Running: alembic $MIGRATION_CMD"
+
+          TASK_ARN=$(aws ecs run-task \
+            --cluster $ECS_CLUSTER \
+            --task-definition production-bound \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ steps.get-vpc.outputs.subnets }}],securityGroups=[${{ steps.get-vpc.outputs.security-groups }}],assignPublicIp=DISABLED}" \
+            --overrides "{
+              \"containerOverrides\": [{
+                \"name\": \"$CONTAINER_NAME\",
+                \"command\": [\"uv\", \"run\", \"alembic\", \"$MIGRATION_CMD\"]
+              }]
+            }" \
+            --query 'tasks[0].taskArn' \
+            --output text)
+
+          echo "task-arn=$TASK_ARN" >> $GITHUB_OUTPUT
+          echo "📋 Task ARN: $TASK_ARN"
+
+      - name: Wait for migration to complete
+        run: |
+          TASK_ARN="${{ steps.run-migration.outputs.task-arn }}"
+
+          echo "⏳ Waiting for migration to complete..."
+          aws ecs wait tasks-stopped \
+            --cluster $ECS_CLUSTER \
+            --tasks $TASK_ARN
+
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster $ECS_CLUSTER \
+            --tasks $TASK_ARN \
+            --query 'tasks[0].containers[0].exitCode' \
+            --output text)
+
+          echo "📊 Exit Code: $EXIT_CODE"
+
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "❌ Migration failed"
+
+            # Try to get logs
+            TASK_ID=$(echo $TASK_ARN | awk -F'/' '{print $NF}')
+            echo "📋 Recent logs:"
+            aws logs tail /ecs/production-bound --since 10m --format short || true
+
+            exit 1
+          fi
+
+          echo "✅ Migration completed successfully"
+
+      - name: Get migration logs
+        if: always()
+        run: |
+          TASK_ARN="${{ steps.run-migration.outputs.task-arn }}"
+          TASK_ID=$(echo $TASK_ARN | awk -F'/' '{print $NF}')
+
+          echo "📋 Migration logs:"
+          aws logs tail /ecs/production-bound --since 15m --format short --filter-pattern "task/$TASK_ID" || echo "No logs found"
