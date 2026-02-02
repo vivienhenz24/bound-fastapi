@@ -17,7 +17,7 @@ jobs:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
     outputs:
-      image-tag: ${{ steps.build-image.outputs.image }}
+      image_tag: ${{ steps.build-image.outputs.image }}
 
     steps:
       - name: Checkout code
@@ -185,7 +185,7 @@ jobs:
         with:
           task-definition: task-definition.json
           container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ needs.build.outputs.image-tag }}
+          image: ${{ needs.build.outputs.image_tag }}
 
       - name: Deploy to Amazon ECS
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1

@@ -36,63 +36,151 @@ jobs:
       - name: Get VPC configuration
         id: get-vpc
         run: |
+          ECS_CLUSTER="${{ secrets.ECS_CLUSTER }}"
+          ECS_SERVICE="${{ secrets.ECS_SERVICE }}"
+
           VPC_CONFIG=$(aws ecs describe-services \
-            --cluster $ECS_CLUSTER \
-            --services $ECS_SERVICE \
+            --cluster ${ECS_CLUSTER} \
+            --services ${ECS_SERVICE} \
             --query 'services[0].networkConfiguration.awsvpcConfiguration' \
             --output json)
 
           SUBNETS=$(echo $VPC_CONFIG | jq -r '.subnets | join(",")')
           SECURITY_GROUPS=$(echo $VPC_CONFIG | jq -r '.securityGroups | join(",")')
 
-          echo "subnets=$SUBNETS" >> $GITHUB_OUTPUT
-          echo "security-groups=$SECURITY_GROUPS" >> $GITHUB_OUTPUT
+          echo "subnets=${SUBNETS}" >> $GITHUB_OUTPUT
+          echo "security-groups=${SECURITY_GROUPS}" >> $GITHUB_OUTPUT
 
-      - name: Run migration command
-        id: run-migration
+      - name: Check migration status
+        id: check-migrations
         run: |
+          ECS_CLUSTER="${{ secrets.ECS_CLUSTER }}"
+          CONTAINER_NAME="bound-fastapi"
+          SUBNETS="${{ steps.get-vpc.outputs.subnets }}"
+          SECURITY_GROUPS="${{ steps.get-vpc.outputs.security-groups }}"
           MIGRATION_CMD="${{ github.event.inputs.migration_command }}"
-          echo "🚀 Running: alembic $MIGRATION_CMD"
 
+          echo "🔍 Checking current migration status..."
+
+          # Run alembic current to get current revision
           TASK_ARN=$(aws ecs run-task \
-            --cluster $ECS_CLUSTER \
+            --cluster ${ECS_CLUSTER} \
             --task-definition production-bound \
             --launch-type FARGATE \
-            --network-configuration "awsvpcConfiguration={subnets=[${{ steps.get-vpc.outputs.subnets }}],securityGroups=[${{ steps.get-vpc.outputs.security-groups }}],assignPublicIp=DISABLED}" \
+            --network-configuration "awsvpcConfiguration={subnets=[${SUBNETS}],securityGroups=[${SECURITY_GROUPS}],assignPublicIp=DISABLED}" \
             --overrides "{
               \"containerOverrides\": [{
-                \"name\": \"$CONTAINER_NAME\",
-                \"command\": [\"uv\", \"run\", \"alembic\", \"$MIGRATION_CMD\"]
+                \"name\": \"${CONTAINER_NAME}\",
+                \"command\": [\"uv\", \"run\", \"alembic\", \"current\"]
               }]
             }" \
             --query 'tasks[0].taskArn' \
             --output text)
 
-          echo "task-arn=$TASK_ARN" >> $GITHUB_OUTPUT
-          echo "📋 Task ARN: $TASK_ARN"
+          # Wait for task to complete
+          aws ecs wait tasks-stopped --cluster ${ECS_CLUSTER} --tasks ${TASK_ARN}
+
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster ${ECS_CLUSTER} \
+            --tasks ${TASK_ARN} \
+            --query 'tasks[0].containers[0].exitCode' \
+            --output text)
+
+          if [ "${EXIT_CODE}" != "0" ]; then
+            echo "⚠️ Could not check migration status (exit code: ${EXIT_CODE})"
+            echo "needs-migration=true" >> $GITHUB_OUTPUT
+            echo "status-message=Unable to check migration status, proceeding anyway" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Get logs to see current revision
+          TASK_ID=$(echo ${TASK_ARN} | awk -F'/' '{print $NF}')
+          sleep 5  # Wait for logs to be available
+
+          CURRENT_OUTPUT=$(aws logs tail /ecs/production-bound --since 2m --format short --filter-pattern "${TASK_ID}" 2>/dev/null || echo "")
+
+          # Check if we're running upgrade head
+          if [ "${MIGRATION_CMD}" = "upgrade head" ]; then
+            # Check if output contains "head" which indicates we're at the latest revision
+            if echo "${CURRENT_OUTPUT}" | grep -q "(head)"; then
+              echo "✅ Database is already at the latest migration (head)"
+              echo "needs-migration=false" >> $GITHUB_OUTPUT
+              echo "status-message=Database is up to date" >> $GITHUB_OUTPUT
+            else
+              echo "📋 Pending migrations detected"
+              echo "needs-migration=true" >> $GITHUB_OUTPUT
+              echo "status-message=Migrations need to be applied" >> $GITHUB_OUTPUT
+            fi
+          else
+            # For other commands (downgrade, current, history), always run
+            echo "📋 Running command: ${MIGRATION_CMD}"
+            echo "needs-migration=true" >> $GITHUB_OUTPUT
+            echo "status-message=Running migration command" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Report migration status
+        run: |
+          echo "📊 Migration Status: ${{ steps.check-migrations.outputs.status-message }}"
+          echo "🔄 Needs Migration: ${{ steps.check-migrations.outputs.needs-migration }}"
+
+      - name: Run migration command
+        id: run-migration
+        if: steps.check-migrations.outputs.needs-migration == 'true'
+        run: |
+          ECS_CLUSTER="${{ secrets.ECS_CLUSTER }}"
+          CONTAINER_NAME="bound-fastapi"
+          SUBNETS="${{ steps.get-vpc.outputs.subnets }}"
+          SECURITY_GROUPS="${{ steps.get-vpc.outputs.security-groups }}"
+          MIGRATION_CMD="${{ github.event.inputs.migration_command }}"
+
+          echo "🚀 Running: alembic ${MIGRATION_CMD}"
+
+          TASK_ARN=$(aws ecs run-task \
+            --cluster ${ECS_CLUSTER} \
+            --task-definition production-bound \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${SUBNETS}],securityGroups=[${SECURITY_GROUPS}],assignPublicIp=DISABLED}" \
+            --overrides "{
+              \"containerOverrides\": [{
+                \"name\": \"${CONTAINER_NAME}\",
+                \"command\": [\"uv\", \"run\", \"alembic\", \"${MIGRATION_CMD}\"]
+              }]
+            }" \
+            --query 'tasks[0].taskArn' \
+            --output text)
+
+          echo "task-arn=${TASK_ARN}" >> $GITHUB_OUTPUT
+          echo "📋 Task ARN: ${TASK_ARN}"
+
+      - name: Skip migration notice
+        if: steps.check-migrations.outputs.needs-migration == 'false'
+        run: |
+          echo "✅ No migration needed - database is already up to date"
 
       - name: Wait for migration to complete
+        if: steps.check-migrations.outputs.needs-migration == 'true'
         run: |
+          ECS_CLUSTER="${{ secrets.ECS_CLUSTER }}"
           TASK_ARN="${{ steps.run-migration.outputs.task-arn }}"
 
           echo "⏳ Waiting for migration to complete..."
           aws ecs wait tasks-stopped \
-            --cluster $ECS_CLUSTER \
-            --tasks $TASK_ARN
+            --cluster ${ECS_CLUSTER} \
+            --tasks ${TASK_ARN}
 
           EXIT_CODE=$(aws ecs describe-tasks \
-            --cluster $ECS_CLUSTER \
-            --tasks $TASK_ARN \
+            --cluster ${ECS_CLUSTER} \
+            --tasks ${TASK_ARN} \
             --query 'tasks[0].containers[0].exitCode' \
             --output text)
 
-          echo "📊 Exit Code: $EXIT_CODE"
+          echo "📊 Exit Code: ${EXIT_CODE}"
 
-          if [ "$EXIT_CODE" != "0" ]; then
+          if [ "${EXIT_CODE}" != "0" ]; then
             echo "❌ Migration failed"
 
             # Try to get logs
-            TASK_ID=$(echo $TASK_ARN | awk -F'/' '{print $NF}')
+            TASK_ID=$(echo ${TASK_ARN} | awk -F'/' '{print $NF}')
             echo "📋 Recent logs:"
             aws logs tail /ecs/production-bound --since 10m --format short || true
 
@@ -102,10 +190,10 @@ jobs:
           echo "✅ Migration completed successfully"
 
       - name: Get migration logs
-        if: always()
+        if: always() && steps.check-migrations.outputs.needs-migration == 'true'
         run: |
           TASK_ARN="${{ steps.run-migration.outputs.task-arn }}"
-          TASK_ID=$(echo $TASK_ARN | awk -F'/' '{print $NF}')
+          TASK_ID=$(echo ${TASK_ARN} | awk -F'/' '{print $NF}')
 
           echo "📋 Migration logs:"
-          aws logs tail /ecs/production-bound --since 15m --format short --filter-pattern "task/$TASK_ID" || echo "No logs found"
+          aws logs tail /ecs/production-bound --since 15m --format short --filter-pattern "task/${TASK_ID}" || echo "No logs found"
