@@ -36,18 +36,19 @@ jobs:
 
       - name: Build, tag, and push image to Amazon ECR
         id: build-image
-        env:
-          IMAGE_TAG: ${{ github.sha }}
         run: |
+          ECR_REPO="${{ secrets.ECR_REPOSITORY }}"
+          IMAGE_TAG="${{ github.sha }}"
+
           # Build Docker image
-          docker build -t $ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REPOSITORY:latest .
+          docker build -t ${ECR_REPO}:${IMAGE_TAG} -t ${ECR_REPO}:latest .
 
           # Push both tags
-          docker push $ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REPOSITORY:latest
+          docker push ${ECR_REPO}:${IMAGE_TAG}
+          docker push ${ECR_REPO}:latest
 
-          echo "image=$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
-          echo "✅ Pushed image: $ECR_REPOSITORY:$IMAGE_TAG"
+          echo "image=${ECR_REPO}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "✅ Pushed image: ${ECR_REPO}:${IMAGE_TAG}"
 
   migrate:
     name: Run Database Migrations
@@ -69,80 +70,90 @@ jobs:
         id: get-task-def
         run: |
           TASK_FAMILY="production-bound"
+          ECS_CLUSTER="${{ secrets.ECS_CLUSTER }}"
+          ECS_SERVICE="${{ secrets.ECS_SERVICE }}"
+
           TASK_DEF_ARN=$(aws ecs describe-services \
-            --cluster $ECS_CLUSTER \
-            --services $ECS_SERVICE \
+            --cluster ${ECS_CLUSTER} \
+            --services ${ECS_SERVICE} \
             --query 'services[0].taskDefinition' \
             --output text)
 
           aws ecs describe-task-definition \
-            --task-definition $TASK_DEF_ARN \
+            --task-definition ${TASK_DEF_ARN} \
             --query 'taskDefinition' > task-definition.json
 
-          echo "task-def-arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+          echo "task-def-arn=${TASK_DEF_ARN}" >> $GITHUB_OUTPUT
 
       - name: Get VPC configuration
         id: get-vpc
         run: |
+          ECS_CLUSTER="${{ secrets.ECS_CLUSTER }}"
+          ECS_SERVICE="${{ secrets.ECS_SERVICE }}"
+
           # Get subnets and security groups from the ECS service
           VPC_CONFIG=$(aws ecs describe-services \
-            --cluster $ECS_CLUSTER \
-            --services $ECS_SERVICE \
+            --cluster ${ECS_CLUSTER} \
+            --services ${ECS_SERVICE} \
             --query 'services[0].networkConfiguration.awsvpcConfiguration' \
             --output json)
 
           SUBNETS=$(echo $VPC_CONFIG | jq -r '.subnets | join(",")')
           SECURITY_GROUPS=$(echo $VPC_CONFIG | jq -r '.securityGroups | join(",")')
 
-          echo "subnets=$SUBNETS" >> $GITHUB_OUTPUT
-          echo "security-groups=$SECURITY_GROUPS" >> $GITHUB_OUTPUT
+          echo "subnets=${SUBNETS}" >> $GITHUB_OUTPUT
+          echo "security-groups=${SECURITY_GROUPS}" >> $GITHUB_OUTPUT
 
       - name: Run database migrations
         id: run-migrations
-        env:
-          IMAGE_TAG: ${{ github.sha }}
         run: |
+          ECS_CLUSTER="${{ secrets.ECS_CLUSTER }}"
+          CONTAINER_NAME="bound-fastapi"
+          SUBNETS="${{ steps.get-vpc.outputs.subnets }}"
+          SECURITY_GROUPS="${{ steps.get-vpc.outputs.security-groups }}"
+
           # Run migration task
           TASK_ARN=$(aws ecs run-task \
-            --cluster $ECS_CLUSTER \
+            --cluster ${ECS_CLUSTER} \
             --task-definition production-bound \
             --launch-type FARGATE \
-            --network-configuration "awsvpcConfiguration={subnets=[${{ steps.get-vpc.outputs.subnets }}],securityGroups=[${{ steps.get-vpc.outputs.security-groups }}],assignPublicIp=DISABLED}" \
-            --overrides '{
-              "containerOverrides": [{
-                "name": "'"$CONTAINER_NAME"'",
-                "command": ["uv", "run", "alembic", "upgrade", "head"]
+            --network-configuration "awsvpcConfiguration={subnets=[${SUBNETS}],securityGroups=[${SECURITY_GROUPS}],assignPublicIp=DISABLED}" \
+            --overrides "{
+              \"containerOverrides\": [{
+                \"name\": \"${CONTAINER_NAME}\",
+                \"command\": [\"uv\", \"run\", \"alembic\", \"upgrade\", \"head\"]
               }]
-            }' \
+            }" \
             --query 'tasks[0].taskArn' \
             --output text)
 
-          echo "task-arn=$TASK_ARN" >> $GITHUB_OUTPUT
-          echo "🚀 Started migration task: $TASK_ARN"
+          echo "task-arn=${TASK_ARN}" >> $GITHUB_OUTPUT
+          echo "🚀 Started migration task: ${TASK_ARN}"
 
       - name: Wait for migrations to complete
         run: |
+          ECS_CLUSTER="${{ secrets.ECS_CLUSTER }}"
           TASK_ARN="${{ steps.run-migrations.outputs.task-arn }}"
 
           echo "⏳ Waiting for migration task to complete..."
           aws ecs wait tasks-stopped \
-            --cluster $ECS_CLUSTER \
-            --tasks $TASK_ARN
+            --cluster ${ECS_CLUSTER} \
+            --tasks ${TASK_ARN}
 
           # Check exit code
           EXIT_CODE=$(aws ecs describe-tasks \
-            --cluster $ECS_CLUSTER \
-            --tasks $TASK_ARN \
+            --cluster ${ECS_CLUSTER} \
+            --tasks ${TASK_ARN} \
             --query 'tasks[0].containers[0].exitCode' \
             --output text)
 
-          if [ "$EXIT_CODE" != "0" ]; then
-            echo "❌ Migration failed with exit code: $EXIT_CODE"
+          if [ "${EXIT_CODE}" != "0" ]; then
+            echo "❌ Migration failed with exit code: ${EXIT_CODE}"
 
             # Get logs for debugging
             echo "📋 Fetching logs..."
-            TASK_ID=$(echo $TASK_ARN | awk -F'/' '{print $NF}')
-            aws logs tail /ecs/production-bound --since 10m --format short --filter-pattern "task/$TASK_ID" || true
+            TASK_ID=$(echo ${TASK_ARN} | awk -F'/' '{print $NF}')
+            aws logs tail /ecs/production-bound --since 10m --format short --filter-pattern "task/${TASK_ID}" || true
 
             exit 1
           fi
@@ -187,9 +198,12 @@ jobs:
       - name: Get deployment status
         if: always()
         run: |
+          ECS_CLUSTER="${{ secrets.ECS_CLUSTER }}"
+          ECS_SERVICE="${{ secrets.ECS_SERVICE }}"
+
           DEPLOYMENT=$(aws ecs describe-services \
-            --cluster $ECS_CLUSTER \
-            --services $ECS_SERVICE \
+            --cluster ${ECS_CLUSTER} \
+            --services ${ECS_SERVICE} \
             --query 'services[0].deployments[0]' \
             --output json)
 
@@ -197,10 +211,10 @@ jobs:
           DESIRED=$(echo $DEPLOYMENT | jq -r '.desiredCount')
           RUNNING=$(echo $DEPLOYMENT | jq -r '.runningCount')
 
-          echo "📊 Deployment Status: $STATUS"
-          echo "📊 Desired: $DESIRED, Running: $RUNNING"
+          echo "📊 Deployment Status: ${STATUS}"
+          echo "📊 Desired: ${DESIRED}, Running: ${RUNNING}"
 
-          if [ "$STATUS" = "PRIMARY" ] && [ "$RUNNING" -eq "$DESIRED" ]; then
+          if [ "${STATUS}" = "PRIMARY" ] && [ "${RUNNING}" -eq "${DESIRED}" ]; then
             echo "✅ Deployment successful!"
           else
             echo "⚠️ Deployment may have issues"
@@ -214,7 +228,7 @@ jobs:
             --query 'LoadBalancers[0].DNSName' \
             --output text)
 
-          echo "🌐 ALB DNS: $ALB_DNS"
+          echo "🌐 ALB DNS: ${ALB_DNS}"
           echo "🔍 Testing health endpoint..."
 
           # Wait a bit for the new tasks to be healthy
@@ -222,11 +236,11 @@ jobs:
 
           # Test health endpoint (try a few times)
           for i in {1..5}; do
-            if curl -f -s "http://$ALB_DNS/health" > /dev/null; then
+            if curl -f -s "http://${ALB_DNS}/health" > /dev/null; then
               echo "✅ Health check passed!"
               exit 0
             fi
-            echo "⏳ Attempt $i failed, retrying..."
+            echo "⏳ Attempt ${i} failed, retrying..."
             sleep 10
           done
 
