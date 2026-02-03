@@ -17,14 +17,14 @@ jobs:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
     outputs:
-      image_tag: ${{ steps.set-output.outputs.image_tag }}
+      image_tag: ${{ steps.build-image.outputs.image_tag }}
 
     steps:
       - name: Debug - Job start
         run: |
           echo "🔍 DEBUG: === BUILD JOB STARTED ==="
           echo "🔍 DEBUG: This job will expose image_tag as output"
-          echo "🔍 DEBUG: Output will be sourced from: steps.set-output.outputs.image_tag"
+          echo "🔍 DEBUG: Output will be sourced from: steps.build-image.outputs.image_tag"
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -56,8 +56,8 @@ jobs:
           docker push ${ECR_REPO}:latest
 
           FULL_IMAGE="${ECR_REPO}:${IMAGE_TAG}"
-          echo "image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
-          echo "🔍 DEBUG: Set output image=${FULL_IMAGE}"
+          echo "image_tag=${FULL_IMAGE}" >> $GITHUB_OUTPUT
+          echo "🔍 DEBUG: Set output image_tag=${FULL_IMAGE}"
           echo "✅ Pushed image: ${FULL_IMAGE}"
 
           # Verify the output was written
@@ -67,41 +67,13 @@ jobs:
       - name: Debug - Verify job output
         run: |
           echo "🔍 DEBUG: Build job step output verification"
-          echo "🔍 DEBUG: steps.build-image.outputs.image = '${{ steps.build-image.outputs.image }}'"
+          echo "🔍 DEBUG: steps.build-image.outputs.image_tag = '${{ steps.build-image.outputs.image_tag }}'"
 
-      - name: Set job output
-        id: set-output
-        run: |
-          echo "🔍 DEBUG: === SET JOB OUTPUT STEP STARTED ==="
-          echo "🔍 DEBUG: Step ID: set-output"
-          IMAGE="${{ steps.build-image.outputs.image }}"
-          echo "🔍 DEBUG: IMAGE variable: ${IMAGE}"
-
-          if [ -z "${IMAGE}" ]; then
-            echo "❌ ERROR: IMAGE is empty in set-output step!"
-            exit 1
-          fi
-
-          echo "🔍 DEBUG: About to write to GITHUB_OUTPUT: ${GITHUB_OUTPUT}"
-          echo "image_tag=${IMAGE}" >> $GITHUB_OUTPUT
-          echo "🔍 DEBUG: Written image_tag to GITHUB_OUTPUT"
-
-          echo "🔍 DEBUG: GITHUB_OUTPUT file contents after write:"
-          cat $GITHUB_OUTPUT
-
-          echo "🔍 DEBUG: === SET JOB OUTPUT STEP COMPLETED ==="
-
-      - name: Verify set-output step output
-        run: |
-          echo "🔍 DEBUG: === VERIFY SET-OUTPUT STEP ==="
-          echo "🔍 DEBUG: steps.set-output.outputs.image_tag = '${{ steps.set-output.outputs.image_tag }}'"
-          echo "🔍 DEBUG: This is what the job outputs will expose"
-
-          if [ -z "${{ steps.set-output.outputs.image_tag }}" ]; then
-            echo "❌ ERROR: set-output step output is empty!"
+          if [ -z "${{ steps.build-image.outputs.image_tag }}" ]; then
+            echo "❌ ERROR: build-image step output is empty!"
             exit 1
           else
-            echo "✅ set-output step output is set correctly"
+            echo "✅ build-image step output is set correctly"
           fi
 
   migrate:
