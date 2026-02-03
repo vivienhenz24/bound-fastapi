@@ -17,7 +17,7 @@ jobs:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
     outputs:
-      image_tag: ${{ steps.build-image.outputs.image }}
+      image_tag: ${{ steps.set-output.outputs.image_tag }}
 
     steps:
       - name: Checkout code
@@ -63,6 +63,13 @@ jobs:
         run: |
           echo "🔍 DEBUG: Build job step output verification"
           echo "🔍 DEBUG: steps.build-image.outputs.image = '${{ steps.build-image.outputs.image }}'"
+
+      - name: Set job output
+        id: set-output
+        run: |
+          IMAGE="${{ steps.build-image.outputs.image }}"
+          echo "🔍 DEBUG: Setting job output: ${IMAGE}"
+          echo "image_tag=${IMAGE}" >> $GITHUB_OUTPUT
 
   migrate:
     name: Run Database Migrations
