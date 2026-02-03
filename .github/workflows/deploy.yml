@@ -40,6 +40,9 @@ jobs:
           ECR_REPO="${{ secrets.ECR_REPOSITORY }}"
           IMAGE_TAG="${{ github.sha }}"
 
+          echo "🔍 DEBUG: ECR_REPO=${ECR_REPO}"
+          echo "🔍 DEBUG: IMAGE_TAG=${IMAGE_TAG}"
+
           # Build Docker image
           docker build -t ${ECR_REPO}:${IMAGE_TAG} -t ${ECR_REPO}:latest .
 
@@ -47,8 +50,19 @@ jobs:
           docker push ${ECR_REPO}:${IMAGE_TAG}
           docker push ${ECR_REPO}:latest
 
-          echo "image=${ECR_REPO}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
-          echo "✅ Pushed image: ${ECR_REPO}:${IMAGE_TAG}"
+          FULL_IMAGE="${ECR_REPO}:${IMAGE_TAG}"
+          echo "image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
+          echo "🔍 DEBUG: Set output image=${FULL_IMAGE}"
+          echo "✅ Pushed image: ${FULL_IMAGE}"
+
+          # Verify the output was written
+          echo "🔍 DEBUG: GITHUB_OUTPUT contents:"
+          cat $GITHUB_OUTPUT || echo "Could not read GITHUB_OUTPUT"
+
+      - name: Debug - Verify job output
+        run: |
+          echo "🔍 DEBUG: Build job step output verification"
+          echo "🔍 DEBUG: steps.build-image.outputs.image = '${{ steps.build-image.outputs.image }}'"
 
   migrate:
     name: Run Database Migrations
@@ -56,6 +70,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Debug - Check build outputs
+        run: |
+          echo "🔍 DEBUG: Checking build job outputs in migrate job"
+          echo "🔍 DEBUG: needs.build.outputs.image_tag = '${{ needs.build.outputs.image_tag }}'"
+          echo "🔍 DEBUG: needs.build.result = '${{ needs.build.result }}'"
+
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -104,8 +124,72 @@ jobs:
           echo "subnets=${SUBNETS}" >> $GITHUB_OUTPUT
           echo "security-groups=${SECURITY_GROUPS}" >> $GITHUB_OUTPUT
 
+      - name: Check migration status
+        id: check-migrations
+        run: |
+          ECS_CLUSTER="${{ secrets.ECS_CLUSTER }}"
+          CONTAINER_NAME="bound-fastapi"
+          SUBNETS="${{ steps.get-vpc.outputs.subnets }}"
+          SECURITY_GROUPS="${{ steps.get-vpc.outputs.security-groups }}"
+
+          echo "🔍 Checking current migration status..."
+
+          # Run alembic current to get current revision
+          TASK_ARN=$(aws ecs run-task \
+            --cluster ${ECS_CLUSTER} \
+            --task-definition production-bound \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${SUBNETS}],securityGroups=[${SECURITY_GROUPS}],assignPublicIp=DISABLED}" \
+            --overrides "{
+              \"containerOverrides\": [{
+                \"name\": \"${CONTAINER_NAME}\",
+                \"command\": [\"uv\", \"run\", \"alembic\", \"current\"]
+              }]
+            }" \
+            --query 'tasks[0].taskArn' \
+            --output text)
+
+          # Wait for task to complete
+          aws ecs wait tasks-stopped --cluster ${ECS_CLUSTER} --tasks ${TASK_ARN}
+
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster ${ECS_CLUSTER} \
+            --tasks ${TASK_ARN} \
+            --query 'tasks[0].containers[0].exitCode' \
+            --output text)
+
+          if [ "${EXIT_CODE}" != "0" ]; then
+            echo "⚠️ Could not check migration status (exit code: ${EXIT_CODE})"
+            echo "needs-migration=true" >> $GITHUB_OUTPUT
+            echo "status-message=Unable to check migration status, proceeding anyway" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Get logs to see current revision
+          TASK_ID=$(echo ${TASK_ARN} | awk -F'/' '{print $NF}')
+          sleep 5  # Wait for logs to be available
+
+          CURRENT_OUTPUT=$(aws logs tail /ecs/production-bound --since 2m --format short --filter-pattern "${TASK_ID}" 2>/dev/null || echo "")
+
+          # Check if output contains "head" which indicates we're at the latest revision
+          if echo "${CURRENT_OUTPUT}" | grep -q "(head)"; then
+            echo "✅ Database is already at the latest migration (head)"
+            echo "needs-migration=false" >> $GITHUB_OUTPUT
+            echo "status-message=Database is up to date" >> $GITHUB_OUTPUT
+          else
+            echo "📋 Pending migrations detected"
+            echo "needs-migration=true" >> $GITHUB_OUTPUT
+            echo "status-message=Migrations need to be applied" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Report migration status
+        run: |
+          echo "📊 Migration Status: ${{ steps.check-migrations.outputs.status-message }}"
+          echo "🔄 Needs Migration: ${{ steps.check-migrations.outputs.needs-migration }}"
+
       - name: Run database migrations
         id: run-migrations
+        if: steps.check-migrations.outputs.needs-migration == 'true'
         run: |
           ECS_CLUSTER="${{ secrets.ECS_CLUSTER }}"
           CONTAINER_NAME="bound-fastapi"
@@ -130,7 +214,13 @@ jobs:
           echo "task-arn=${TASK_ARN}" >> $GITHUB_OUTPUT
           echo "🚀 Started migration task: ${TASK_ARN}"
 
+      - name: Skip migration notice
+        if: steps.check-migrations.outputs.needs-migration == 'false'
+        run: |
+          echo "✅ No migration needed - database is already up to date"
+
       - name: Wait for migrations to complete
+        if: steps.check-migrations.outputs.needs-migration == 'true'
         run: |
           ECS_CLUSTER="${{ secrets.ECS_CLUSTER }}"
           TASK_ARN="${{ steps.run-migrations.outputs.task-arn }}"
@@ -166,6 +256,20 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Debug - Check build outputs
+        run: |
+          echo "🔍 DEBUG: Checking build job outputs"
+          echo "🔍 DEBUG: needs.build.outputs.image_tag = '${{ needs.build.outputs.image_tag }}'"
+          echo "🔍 DEBUG: needs.build.result = '${{ needs.build.result }}'"
+          echo "🔍 DEBUG: needs.migrate.result = '${{ needs.migrate.result }}'"
+
+          if [ -z "${{ needs.build.outputs.image_tag }}" ]; then
+            echo "❌ ERROR: image_tag is empty!"
+            exit 1
+          else
+            echo "✅ image_tag is set"
+          fi
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -178,6 +282,13 @@ jobs:
           aws ecs describe-task-definition \
             --task-definition production-bound \
             --query taskDefinition > task-definition.json
+
+      - name: Debug - Before rendering task definition
+        run: |
+          echo "🔍 DEBUG: About to render task definition"
+          echo "🔍 DEBUG: task-definition file exists: $(test -f task-definition.json && echo 'YES' || echo 'NO')"
+          echo "🔍 DEBUG: container-name: ${{ env.CONTAINER_NAME }}"
+          echo "🔍 DEBUG: image to use: ${{ needs.build.outputs.image_tag }}"
 
       - name: Update task definition with new image
         id: task-def
