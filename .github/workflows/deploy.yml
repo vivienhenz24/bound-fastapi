@@ -16,15 +16,10 @@ jobs:
   build:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
-    outputs:
-      image_tag: ${{ steps.build-image.outputs.image_tag }}
+    # Note: Job outputs removed - deploy job constructs image tag directly
+    # using secrets.ECR_REPOSITORY and github.sha to avoid masking issues
 
     steps:
-      - name: Debug - Job start
-        run: |
-          echo "🔍 DEBUG: === BUILD JOB STARTED ==="
-          echo "🔍 DEBUG: This job will expose image_tag as output"
-          echo "🔍 DEBUG: Output will be sourced from: steps.build-image.outputs.image_tag"
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -56,25 +51,8 @@ jobs:
           docker push ${ECR_REPO}:latest
 
           FULL_IMAGE="${ECR_REPO}:${IMAGE_TAG}"
-          echo "image_tag=${FULL_IMAGE}" >> $GITHUB_OUTPUT
-          echo "🔍 DEBUG: Set output image_tag=${FULL_IMAGE}"
           echo "✅ Pushed image: ${FULL_IMAGE}"
-
-          # Verify the output was written
-          echo "🔍 DEBUG: GITHUB_OUTPUT contents:"
-          cat $GITHUB_OUTPUT || echo "Could not read GITHUB_OUTPUT"
-
-      - name: Debug - Verify job output
-        run: |
-          echo "🔍 DEBUG: Build job step output verification"
-          echo "🔍 DEBUG: steps.build-image.outputs.image_tag = '${{ steps.build-image.outputs.image_tag }}'"
-
-          if [ -z "${{ steps.build-image.outputs.image_tag }}" ]; then
-            echo "❌ ERROR: build-image step output is empty!"
-            exit 1
-          else
-            echo "✅ build-image step output is set correctly"
-          fi
+          echo "📝 Deploy job will construct image as: \$ECR_REPOSITORY:\$github.sha"
 
   migrate:
     name: Run Database Migrations
@@ -82,14 +60,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Debug - Check build outputs
-        run: |
-          echo "🔍 DEBUG: === MIGRATE JOB - BUILD OUTPUTS CHECK ==="
-          echo "🔍 DEBUG: needs.build.outputs.image_tag = '${{ needs.build.outputs.image_tag }}'"
-          echo "🔍 DEBUG: needs.build.result = '${{ needs.build.result }}'"
-          echo "🔍 DEBUG: Available outputs from build job:"
-          echo '${{ toJSON(needs.build.outputs) }}'
-
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -270,24 +240,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Debug - Check build outputs
+      - name: Debug - Deploy job start
         run: |
-          echo "🔍 DEBUG: === DEPLOY JOB - BUILD OUTPUTS CHECK ==="
-          echo "🔍 DEBUG: needs.build.outputs.image_tag = '${{ needs.build.outputs.image_tag }}'"
+          echo "🔍 DEBUG: === DEPLOY JOB STARTED ==="
           echo "🔍 DEBUG: needs.build.result = '${{ needs.build.result }}'"
           echo "🔍 DEBUG: needs.migrate.result = '${{ needs.migrate.result }}'"
-          echo "🔍 DEBUG: All outputs from build job:"
-          echo '${{ toJSON(needs.build.outputs) }}'
-          echo "🔍 DEBUG: All outputs from build (alternative):"
-          echo '${{ toJSON(needs.build) }}'
-
-          if [ -z "${{ needs.build.outputs.image_tag }}" ]; then
-            echo "❌ ERROR: image_tag is empty!"
-            echo "🔍 DEBUG: Job outputs object is empty or image_tag was not set"
-            exit 1
-          else
-            echo "✅ image_tag is set"
-          fi
+          echo "🔍 DEBUG: Will use image: \$ECR_REPOSITORY:${{ github.sha }}"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -307,7 +265,7 @@ jobs:
           echo "🔍 DEBUG: About to render task definition"
           echo "🔍 DEBUG: task-definition file exists: $(test -f task-definition.json && echo 'YES' || echo 'NO')"
           echo "🔍 DEBUG: container-name: ${{ env.CONTAINER_NAME }}"
-          echo "🔍 DEBUG: image to use: ${{ needs.build.outputs.image_tag }}"
+          echo "🔍 DEBUG: image to use (constructed): ${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}"
 
       - name: Update task definition with new image
         id: task-def
@@ -315,7 +273,7 @@ jobs:
         with:
           task-definition: task-definition.json
           container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ needs.build.outputs.image_tag }}
+          image: ${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}
 
       - name: Deploy to Amazon ECS
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
