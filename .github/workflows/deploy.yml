@@ -20,6 +20,11 @@ jobs:
       image_tag: ${{ steps.set-output.outputs.image_tag }}
 
     steps:
+      - name: Debug - Job start
+        run: |
+          echo "🔍 DEBUG: === BUILD JOB STARTED ==="
+          echo "🔍 DEBUG: This job will expose image_tag as output"
+          echo "🔍 DEBUG: Output will be sourced from: steps.set-output.outputs.image_tag"
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -67,9 +72,37 @@ jobs:
       - name: Set job output
         id: set-output
         run: |
+          echo "🔍 DEBUG: === SET JOB OUTPUT STEP STARTED ==="
+          echo "🔍 DEBUG: Step ID: set-output"
           IMAGE="${{ steps.build-image.outputs.image }}"
-          echo "🔍 DEBUG: Setting job output: ${IMAGE}"
+          echo "🔍 DEBUG: IMAGE variable: ${IMAGE}"
+
+          if [ -z "${IMAGE}" ]; then
+            echo "❌ ERROR: IMAGE is empty in set-output step!"
+            exit 1
+          fi
+
+          echo "🔍 DEBUG: About to write to GITHUB_OUTPUT: ${GITHUB_OUTPUT}"
           echo "image_tag=${IMAGE}" >> $GITHUB_OUTPUT
+          echo "🔍 DEBUG: Written image_tag to GITHUB_OUTPUT"
+
+          echo "🔍 DEBUG: GITHUB_OUTPUT file contents after write:"
+          cat $GITHUB_OUTPUT
+
+          echo "🔍 DEBUG: === SET JOB OUTPUT STEP COMPLETED ==="
+
+      - name: Verify set-output step output
+        run: |
+          echo "🔍 DEBUG: === VERIFY SET-OUTPUT STEP ==="
+          echo "🔍 DEBUG: steps.set-output.outputs.image_tag = '${{ steps.set-output.outputs.image_tag }}'"
+          echo "🔍 DEBUG: This is what the job outputs will expose"
+
+          if [ -z "${{ steps.set-output.outputs.image_tag }}" ]; then
+            echo "❌ ERROR: set-output step output is empty!"
+            exit 1
+          else
+            echo "✅ set-output step output is set correctly"
+          fi
 
   migrate:
     name: Run Database Migrations
@@ -79,9 +112,11 @@ jobs:
     steps:
       - name: Debug - Check build outputs
         run: |
-          echo "🔍 DEBUG: Checking build job outputs in migrate job"
+          echo "🔍 DEBUG: === MIGRATE JOB - BUILD OUTPUTS CHECK ==="
           echo "🔍 DEBUG: needs.build.outputs.image_tag = '${{ needs.build.outputs.image_tag }}'"
           echo "🔍 DEBUG: needs.build.result = '${{ needs.build.result }}'"
+          echo "🔍 DEBUG: Available outputs from build job:"
+          echo '${{ toJSON(needs.build.outputs) }}'
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -265,13 +300,18 @@ jobs:
     steps:
       - name: Debug - Check build outputs
         run: |
-          echo "🔍 DEBUG: Checking build job outputs"
+          echo "🔍 DEBUG: === DEPLOY JOB - BUILD OUTPUTS CHECK ==="
           echo "🔍 DEBUG: needs.build.outputs.image_tag = '${{ needs.build.outputs.image_tag }}'"
           echo "🔍 DEBUG: needs.build.result = '${{ needs.build.result }}'"
           echo "🔍 DEBUG: needs.migrate.result = '${{ needs.migrate.result }}'"
+          echo "🔍 DEBUG: All outputs from build job:"
+          echo '${{ toJSON(needs.build.outputs) }}'
+          echo "🔍 DEBUG: All outputs from build (alternative):"
+          echo '${{ toJSON(needs.build) }}'
 
           if [ -z "${{ needs.build.outputs.image_tag }}" ]; then
             echo "❌ ERROR: image_tag is empty!"
+            echo "🔍 DEBUG: Job outputs object is empty or image_tag was not set"
             exit 1
           else
             echo "✅ image_tag is set"
