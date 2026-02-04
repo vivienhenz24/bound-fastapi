@@ -2,7 +2,7 @@ from datetime import datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import Boolean, String, Text, Uuid
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
 from app.db.base import Base
@@ -33,4 +33,15 @@ class User(Base):
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
+    )
+
+    # TTS Relationships
+    tts_datasets = relationship(
+        "TTSDataset", back_populates="user", cascade="all, delete-orphan"
+    )
+    tts_training_jobs = relationship(
+        "TTSTrainingJob", back_populates="user", cascade="all, delete-orphan"
+    )
+    tts_models = relationship(
+        "TTSModel", back_populates="user", cascade="all, delete-orphan"
     )
