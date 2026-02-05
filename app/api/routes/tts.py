@@ -1,5 +1,6 @@
-"""TTS API routes for datasets, training jobs, models, and inference."""
+"""TTS API routes for dataset management and audio processing."""
 
+from pathlib import Path
 from uuid import UUID
 
 from fastapi import (
@@ -18,42 +19,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_active_user
 from app.db.session import get_db
 from app.models.tts_dataset import DatasetStatus, TTSDataset, TranscriptType
-from app.models.tts_model import TTSModel
-from app.models.tts_training_job import JobStatus, TTSTrainingJob
 from app.models.user import User
 from app.schemas.tts import (
-    DatasetCreate,
     DatasetListResponse,
     DatasetResponse,
-    DatasetUpdate,
-    InferenceRequest,
-    InferenceResponse,
-    JobCreate,
-    JobListResponse,
-    JobResponse,
-    ModelDownloadResponse,
-    ModelListResponse,
-    ModelResponse,
-    ModelUpdate,
-    QueueStatusResponse,
 )
-from app.services import audio_processor, job_queue, s3, tts_inference
+from app.services import audio_processor, s3
 
 router = APIRouter(prefix="/tts", tags=["tts"])
 
 
-# ============================================================================
-# Dataset Endpoints
-# ============================================================================
-
-
 @router.post("/datasets", response_model=DatasetResponse, status_code=status.HTTP_201_CREATED)
 async def create_dataset(
+    background_tasks: BackgroundTasks,
     audio: UploadFile = File(...),
     transcript: UploadFile = File(...),
     name: str = Form(...),
     description: str | None = Form(None),
     transcript_type: str = Form("text"),
+    auto_process: bool = Form(True),
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -83,16 +67,23 @@ async def create_dataset(
     dataset_id = uuid4()
 
     # Upload files to S3
-    audio_s3_key = f"users/{current_user.id}/datasets/{dataset_id}/source_audio.wav"
+    audio_extension = Path(audio.filename or "").suffix.lower().lstrip(".") or "wav"
+    audio_s3_key = (
+        f"users/{current_user.id}/datasets/{dataset_id}/source_audio.{audio_extension}"
+    )
     transcript_ext = "srt" if transcript_type == "srt" else "txt"
     transcript_s3_key = f"users/{current_user.id}/datasets/{dataset_id}/transcript.{transcript_ext}"
 
     try:
-        s3.upload_file(audio_s3_key, audio_data, content_type="audio/wav")
+        audio_content_type = audio.content_type or "application/octet-stream"
+        transcript_content_type = (
+            "application/x-subrip" if transcript_type == "srt" else "text/plain"
+        )
+        s3.upload_file(audio_s3_key, audio_data, content_type=audio_content_type)
         s3.upload_file(
             transcript_s3_key,
             transcript_data,
-            content_type="text/plain" if transcript_type == "text" else "text/srt",
+            content_type=transcript_content_type,
         )
     except Exception as e:
         raise HTTPException(
@@ -109,11 +100,24 @@ async def create_dataset(
         audio_s3_key=audio_s3_key,
         transcript_s3_key=transcript_s3_key,
         transcript_type=transcript_type,
-        status=DatasetStatus.PENDING.value,
+        status=DatasetStatus.PROCESSING.value
+        if auto_process
+        else DatasetStatus.PENDING.value,
+        error_message=None,
     )
     db.add(dataset)
     await db.commit()
     await db.refresh(dataset)
+
+    if auto_process:
+        background_tasks.add_task(
+            _process_dataset_task,
+            user_id=current_user.id,
+            dataset_id=dataset_id,
+            audio_s3_key=audio_s3_key,
+            transcript_s3_key=transcript_s3_key,
+            transcript_type=transcript_type,
+        )
 
     return dataset
 
@@ -176,21 +180,6 @@ async def delete_dataset(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Dataset not found",
-        )
-
-    # Check if any training jobs are using this dataset
-    jobs_result = await db.execute(
-        select(TTSTrainingJob).where(
-            TTSTrainingJob.dataset_id == dataset_id,
-            TTSTrainingJob.status.in_([JobStatus.QUEUED.value, JobStatus.TRAINING.value]),
-        )
-    )
-    active_jobs = jobs_result.scalars().first()
-
-    if active_jobs:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot delete dataset with active training jobs",
         )
 
     await db.delete(dataset)
@@ -292,314 +281,3 @@ async def process_dataset(
     await db.refresh(dataset)
 
     return dataset
-
-
-# ============================================================================
-# Training Job Endpoints
-# ============================================================================
-
-
-@router.post("/jobs", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
-async def create_job(
-    job_data: JobCreate,
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Create a new training job."""
-    try:
-        job = await job_queue.create_training_job(
-            db=db,
-            user_id=current_user.id,
-            dataset_id=job_data.dataset_id,
-            name=job_data.name,
-            epochs=job_data.epochs,
-            learning_rate=job_data.learning_rate,
-            batch_size=job_data.batch_size,
-        )
-        return job
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e),
-        )
-
-
-@router.get("/jobs", response_model=list[JobListResponse])
-async def list_jobs(
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """List all training jobs for the current user."""
-    result = await db.execute(
-        select(TTSTrainingJob)
-        .where(TTSTrainingJob.user_id == current_user.id)
-        .order_by(TTSTrainingJob.created_at.desc())
-    )
-    jobs = result.scalars().all()
-    return jobs
-
-
-@router.get("/jobs/queue", response_model=QueueStatusResponse)
-async def get_queue_status(
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Get global queue status."""
-    queue_status = await job_queue.get_queue_status(db)
-
-    # Get user's queued/training jobs
-    result = await db.execute(
-        select(TTSTrainingJob)
-        .where(
-            TTSTrainingJob.user_id == current_user.id,
-            TTSTrainingJob.status.in_([
-                JobStatus.QUEUED.value,
-                JobStatus.PREPARING.value,
-                JobStatus.TRAINING.value,
-            ]),
-        )
-        .order_by(TTSTrainingJob.queue_position, TTSTrainingJob.created_at)
-    )
-    jobs = result.scalars().all()
-
-    return QueueStatusResponse(
-        total_queued=queue_status["total_queued"],
-        total_training=queue_status["total_training"],
-        jobs=[JobListResponse.model_validate(j) for j in jobs],
-    )
-
-
-@router.get("/jobs/{job_id}", response_model=JobResponse)
-async def get_job(
-    job_id: UUID,
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Get a specific training job."""
-    result = await db.execute(
-        select(TTSTrainingJob).where(
-            TTSTrainingJob.id == job_id,
-            TTSTrainingJob.user_id == current_user.id,
-        )
-    )
-    job = result.scalar_one_or_none()
-
-    if not job:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Job not found",
-        )
-
-    return job
-
-
-@router.post("/jobs/{job_id}/cancel", response_model=JobResponse)
-async def cancel_job(
-    job_id: UUID,
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Cancel a training job."""
-    try:
-        await job_queue.cancel_training_job(db, job_id, current_user.id)
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e),
-        )
-
-    # Refresh and return the job
-    result = await db.execute(
-        select(TTSTrainingJob).where(TTSTrainingJob.id == job_id)
-    )
-    job = result.scalar_one()
-    return job
-
-
-# ============================================================================
-# Model Endpoints
-# ============================================================================
-
-
-@router.get("/models", response_model=list[ModelListResponse])
-async def list_models(
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """List all models for the current user."""
-    result = await db.execute(
-        select(TTSModel)
-        .where(
-            TTSModel.user_id == current_user.id,
-            TTSModel.is_deleted == False,  # noqa: E712
-        )
-        .order_by(TTSModel.created_at.desc())
-    )
-    models = result.scalars().all()
-    return models
-
-
-@router.get("/models/{model_id}", response_model=ModelResponse)
-async def get_model(
-    model_id: UUID,
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Get a specific model."""
-    result = await db.execute(
-        select(TTSModel).where(
-            TTSModel.id == model_id,
-            TTSModel.is_deleted == False,  # noqa: E712
-        )
-    )
-    model = result.scalar_one_or_none()
-
-    if not model:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Model not found",
-        )
-
-    # Check authorization
-    if model.user_id != current_user.id and not model.is_public:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Model not accessible",
-        )
-
-    return model
-
-
-@router.patch("/models/{model_id}", response_model=ModelResponse)
-async def update_model(
-    model_id: UUID,
-    model_data: ModelUpdate,
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Update model name/description."""
-    result = await db.execute(
-        select(TTSModel).where(
-            TTSModel.id == model_id,
-            TTSModel.user_id == current_user.id,
-            TTSModel.is_deleted == False,  # noqa: E712
-        )
-    )
-    model = result.scalar_one_or_none()
-
-    if not model:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Model not found",
-        )
-
-    # Update fields
-    if model_data.name is not None:
-        model.name = model_data.name
-    if model_data.description is not None:
-        model.description = model_data.description
-    if model_data.is_public is not None:
-        model.is_public = model_data.is_public
-
-    await db.commit()
-    await db.refresh(model)
-
-    return model
-
-
-@router.delete("/models/{model_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_model(
-    model_id: UUID,
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Soft delete a model."""
-    result = await db.execute(
-        select(TTSModel).where(
-            TTSModel.id == model_id,
-            TTSModel.user_id == current_user.id,
-            TTSModel.is_deleted == False,  # noqa: E712
-        )
-    )
-    model = result.scalar_one_or_none()
-
-    if not model:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Model not found",
-        )
-
-    model.is_deleted = True
-    await db.commit()
-
-
-@router.get("/models/{model_id}/download", response_model=ModelDownloadResponse)
-async def get_model_download_url(
-    model_id: UUID,
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Get a presigned URL to download a model."""
-    result = await db.execute(
-        select(TTSModel).where(
-            TTSModel.id == model_id,
-            TTSModel.is_deleted == False,  # noqa: E712
-        )
-    )
-    model = result.scalar_one_or_none()
-
-    if not model:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Model not found",
-        )
-
-    # Check authorization
-    if model.user_id != current_user.id and not model.is_public:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Model not accessible",
-        )
-
-    try:
-        download_url = s3.generate_presigned_url(model.model_s3_key, expiration=3600)
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to generate download URL: {str(e)}",
-        )
-
-    return ModelDownloadResponse(download_url=download_url)
-
-
-# ============================================================================
-# Inference Endpoint
-# ============================================================================
-
-
-@router.post("/models/{model_id}/infer", response_model=InferenceResponse)
-async def infer(
-    model_id: UUID,
-    request: InferenceRequest,
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Generate speech from text using a model."""
-    result = await tts_inference.generate_speech(
-        db=db,
-        model_id=model_id,
-        user_id=current_user.id,
-        text=request.text,
-        speaker_id=request.speaker_id,
-    )
-
-    if not result.success:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=result.error or "Inference failed",
-        )
-
-    return InferenceResponse(
-        audio_url=result.audio_url,
-        duration_seconds=result.duration_seconds,
-    )

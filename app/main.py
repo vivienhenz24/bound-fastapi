@@ -6,16 +6,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import api_router
 from app.core.config import settings
 from app.db.session import engine
-from app.services import job_queue
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start background tasks
-    job_queue.start_polling()
     yield
-    # Cleanup
-    job_queue.stop_polling()
     await engine.dispose()
 
 

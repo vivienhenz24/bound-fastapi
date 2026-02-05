@@ -7,13 +7,7 @@ from app.core.config import settings
 from app.db.base import Base
 
 # Import models so Alembic can detect them
-from app.models import (  # noqa: F401
-    RefreshToken,
-    TTSDataset,
-    TTSModel,
-    TTSTrainingJob,
-    User,
-)
+from app.models import RefreshToken, TTSDataset, User  # noqa: F401
 
 config = context.config
 

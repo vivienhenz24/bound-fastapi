@@ -2,17 +2,13 @@
 
 Handles:
 - SRT parsing and audio segmentation
-- Plain text processing with Whisper for forced alignment
 - Training data JSONL generation
 """
 
 import json
 import logging
-import os
-import tempfile
 from dataclasses import dataclass
 from io import BytesIO
-from pathlib import Path
 from uuid import UUID
 
 import pysrt
@@ -80,6 +76,26 @@ def parse_srt_file(srt_content: str) -> list[dict]:
     return entries
 
 
+def parse_plain_text(text_content: str, audio_duration_ms: int) -> list[dict]:
+    """Create a single segment from plain text (full audio).
+
+    For plain text without timestamps, we treat the entire audio as one segment.
+    This is a simple fallback - for proper alignment, use SRT format.
+
+    Args:
+        text_content: Raw text content
+        audio_duration_ms: Total audio duration in milliseconds
+
+    Returns:
+        List with single segment entry
+    """
+    text = text_content.strip()
+    if not text:
+        return []
+
+    return [{"start_ms": 0, "end_ms": audio_duration_ms, "text": text}]
+
+
 def segment_audio_by_timestamps(
     audio_data: bytes, timestamps: list[dict]
 ) -> list[AudioSegmentData]:
@@ -124,63 +140,8 @@ def segment_audio_by_timestamps(
     return segments
 
 
-def process_with_whisper_alignment(
-    audio_data: bytes, transcript_text: str
-) -> list[dict]:
-    """Use Whisper to get word-level timestamps and align with transcript.
-
-    This performs forced alignment to match the transcript text with audio.
-
-    Args:
-        audio_data: Raw audio file bytes
-        transcript_text: Full transcript text
-
-    Returns:
-        List of timestamp entries for sentence-level segments
-    """
-    try:
-        import whisper
-    except ImportError:
-        raise RuntimeError("Whisper is required for plain text alignment")
-
-    # Save audio to temp file (whisper needs file path)
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        f.write(audio_data)
-        temp_path = f.name
-
-    try:
-        # Load whisper model
-        model = whisper.load_model("base")
-
-        # Transcribe with word timestamps
-        result = model.transcribe(
-            temp_path,
-            word_timestamps=True,
-            language=None,  # Auto-detect
-        )
-
-        # Extract segments from whisper output
-        timestamps = []
-        for segment in result.get("segments", []):
-            text = segment.get("text", "").strip()
-            if text:
-                timestamps.append(
-                    {
-                        "start_ms": int(segment["start"] * 1000),
-                        "end_ms": int(segment["end"] * 1000),
-                        "text": text,
-                    }
-                )
-
-        return timestamps
-
-    finally:
-        # Clean up temp file
-        os.unlink(temp_path)
-
-
 def generate_training_jsonl(segments: list[AudioSegmentData], s3_keys: list[str]) -> str:
-    """Generate JSONL training data for Qwen3-TTS.
+    """Generate JSONL training data.
 
     Args:
         segments: List of audio segments with text
@@ -227,15 +188,19 @@ async def process_dataset(
 
         logger.info(f"Downloading transcript from {transcript_s3_key}")
         transcript_data = s3.download_file(transcript_s3_key)
-        transcript_text = transcript_data.decode("utf-8")
+        transcript_text = transcript_data.decode("utf-8", errors="replace")
+
+        # Get audio duration for plain text processing
+        audio = AudioSegment.from_file(BytesIO(audio_data))
+        audio_duration_ms = len(audio)
 
         # Parse timestamps based on transcript type
         if transcript_type == "srt":
             logger.info("Processing SRT transcript")
             timestamps = parse_srt_file(transcript_text)
         else:
-            logger.info("Processing plain text with Whisper alignment")
-            timestamps = process_with_whisper_alignment(audio_data, transcript_text)
+            logger.info("Processing plain text (single segment)")
+            timestamps = parse_plain_text(transcript_text, audio_duration_ms)
 
         if not timestamps:
             return ProcessingResult(

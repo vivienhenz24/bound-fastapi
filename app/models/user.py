@@ -39,9 +39,3 @@ class User(Base):
     tts_datasets = relationship(
         "TTSDataset", back_populates="user", cascade="all, delete-orphan"
     )
-    tts_training_jobs = relationship(
-        "TTSTrainingJob", back_populates="user", cascade="all, delete-orphan"
-    )
-    tts_models = relationship(
-        "TTSModel", back_populates="user", cascade="all, delete-orphan"
-    )

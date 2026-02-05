@@ -33,16 +33,9 @@ class Settings(BaseSettings):
     s3_bucket_name: str = ""
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
-
-    # RunPod Configuration
-    runpod_api_key: str = ""
-    runpod_training_endpoint_id: str = ""
-    runpod_inference_endpoint_id: str = ""
+    aws_session_token: str = ""
 
     # TTS Configuration
-    qwen3_tokenizer_model: str = "Qwen3-TTS-Tokenizer-12Hz"
-    qwen3_base_model: str = "Qwen3-TTS-12Hz-1.7B-Base"
-    tts_models_cache_dir: str = "/tmp/tts_models"
     max_audio_duration_seconds: int = 3600
     max_audio_file_size_mb: int = 500
 

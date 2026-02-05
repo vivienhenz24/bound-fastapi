@@ -53,6 +53,3 @@ class TTSDataset(Base):
 
     # Relationships
     user = relationship("User", back_populates="tts_datasets")
-    training_jobs = relationship(
-        "TTSTrainingJob", back_populates="dataset", cascade="all, delete-orphan"
-    )

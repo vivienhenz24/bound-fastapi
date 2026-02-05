@@ -17,12 +17,9 @@ dependencies = [
     "python-jose[cryptography]>=3.5.0",
     "python-multipart>=0.0.22",
     "sqlalchemy>=2.0.46",
-    # TTS dependencies
+    # Audio processing
     "pydub>=0.25.1",
     "pysrt>=1.1.2",
-    "librosa>=0.10.0",
-    "soundfile>=0.12.1",
-    "openai-whisper>=20231117",
 ]
 
 [dependency-groups]
