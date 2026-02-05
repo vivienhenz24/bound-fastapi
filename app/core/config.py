@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     resend_from_email: str = ""
     resend_from_name: str = "bound"
 
+    # Google OAuth
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    google_redirect_uri: str = ""
+    google_oauth_scopes: str = "openid email profile"
+
     # AWS S3
     aws_region: str = "us-east-1"
     s3_bucket_name: str = ""

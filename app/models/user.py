@@ -26,6 +26,9 @@ class User(Base):
     email_verification_expires_at: Mapped[datetime | None] = mapped_column(
         nullable=True
     )
+    google_sub: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         server_default=func.now(), nullable=False
     )
