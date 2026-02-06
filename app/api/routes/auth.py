@@ -16,6 +16,8 @@ from fastapi import (
     status,
 )
 from fastapi.responses import RedirectResponse
+from jose import jwt
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -42,9 +44,7 @@ from app.schemas.auth import (
     UserResponse,
     VerifyEmailRequest,
 )
-from pydantic import BaseModel
 from app.services.email import send_verification_email
-from jose import jwt
 
 GOOGLE_AUTH_BASE = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
@@ -87,7 +87,7 @@ def _generate_code_challenge(code_verifier: str) -> str:
 
 
 def _clear_oauth_cookie(response: Response, name: str) -> None:
-    response.delete_cookie(key=name, domain=_cookie_domain())
+    response.delete_cookie(key=name, domain=_cookie_domain(), path="/")
 
 
 async def _exchange_google_code(code: str, code_verifier: str) -> dict:
@@ -123,7 +123,9 @@ def _create_exchange_code(user_id: str) -> str:
         "type": "google_exchange",
         "exp": datetime.now(UTC) + timedelta(minutes=5),
     }
-    return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
+    return jwt.encode(
+        payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm
+    )
 
 
 def _decode_exchange_code(token: str) -> str:
@@ -134,12 +136,14 @@ def _decode_exchange_code(token: str) -> str:
 
 
 def _oauth_cookie_params():
+    # OAuth cookies use "lax" since user navigates directly to backend
     return {
         "httponly": True,
         "secure": _cookie_secure(),
         "samesite": "lax",
         "domain": _cookie_domain(),
         "max_age": 600,
+        "path": "/",
     }
 
 
@@ -190,11 +194,15 @@ async def google_callback(
     _clear_oauth_cookie(response, "google_oauth_redirect")
 
     if not code or not state or not cookie_state or not code_verifier:
-        response.headers["Location"] = f"{settings.frontend_url}/login?error=google_oauth"
+        response.headers["Location"] = (
+            f"{settings.frontend_url}/login?error=google_oauth"
+        )
         return response
 
     if state != cookie_state:
-        response.headers["Location"] = f"{settings.frontend_url}/login?error=google_oauth"
+        response.headers["Location"] = (
+            f"{settings.frontend_url}/login?error=google_oauth"
+        )
         return response
 
     try:
@@ -245,7 +253,9 @@ async def google_callback(
         response.headers["Location"] = redirect_url
         return response
     except Exception:
-        response.headers["Location"] = f"{settings.frontend_url}/login?error=google_oauth"
+        response.headers["Location"] = (
+            f"{settings.frontend_url}/login?error=google_oauth"
+        )
         return response
 
 
@@ -276,7 +286,7 @@ async def google_complete(
     access_token = create_access_token(data={"sub": user.email})
     refresh_token = create_refresh_token(data={"sub": user.email})
 
-    expires_at = datetime.utcnow() + timedelta(days=7)
+    expires_at = datetime.now(UTC) + timedelta(days=7)
     refresh_token_record = RefreshToken(
         user_id=user.id,
         token_hash=generate_token_hash(refresh_token),
@@ -290,9 +300,10 @@ async def google_complete(
         value=refresh_token,
         httponly=True,
         secure=_cookie_secure(),
-        samesite="lax",
+        samesite=_cookie_samesite(),
         max_age=settings.refresh_token_expire_days * 24 * 60 * 60,
         domain=_cookie_domain(),
+        path="/",
     )
 
     return TokenResponse(access_token=access_token)
@@ -311,6 +322,13 @@ def _cookie_secure() -> bool:
     if settings.cookie_secure:
         return True
     return urlparse(settings.frontend_url).scheme == "https"
+
+
+def _cookie_samesite() -> str:
+    """Return 'none' for cross-origin, 'lax' for same-origin (localhost)."""
+    if _cookie_secure():
+        return "none"
+    return "lax"
 
 
 @router.post(
@@ -334,7 +352,7 @@ async def register(
             existing_user.email_verification_token_hash = generate_token_hash(
                 verification_token
             )
-            existing_user.email_verification_expires_at = datetime.utcnow() + timedelta(
+            existing_user.email_verification_expires_at = datetime.now(UTC) + timedelta(
                 hours=settings.email_verification_token_expire_hours
             )
             await db.commit()
@@ -359,7 +377,7 @@ async def register(
         first_name=user_data.first_name,
         last_name=user_data.last_name,
         email_verification_token_hash=generate_token_hash(verification_token),
-        email_verification_expires_at=datetime.utcnow()
+        email_verification_expires_at=datetime.now(UTC)
         + timedelta(hours=settings.email_verification_token_expire_hours),
     )
 
@@ -410,8 +428,8 @@ async def login(
     # Create refresh token
     refresh_token = create_refresh_token(data={"sub": user.email})
 
-    # Store refresh token in database (simplified - store token directly)
-    expires_at = datetime.now() + timedelta(days=7)
+    # Store refresh token in database
+    expires_at = datetime.now(UTC) + timedelta(days=7)
 
     refresh_token_record = RefreshToken(
         user_id=user.id,
@@ -427,9 +445,10 @@ async def login(
         value=refresh_token,
         httponly=True,
         secure=_cookie_secure(),
-        samesite="lax",
+        samesite=_cookie_samesite(),
         max_age=settings.refresh_token_expire_days * 24 * 60 * 60,
         domain=_cookie_domain(),
+        path="/",
     )
 
     return TokenResponse(access_token=access_token)
@@ -477,7 +496,7 @@ async def refresh_token(
         select(RefreshToken).where(
             RefreshToken.user_id == user.id,
             RefreshToken.revoked == False,  # noqa: E712
-            RefreshToken.expires_at > datetime.now(),
+            RefreshToken.expires_at > datetime.now(UTC),
             (RefreshToken.token_hash == refresh_token_hash)
             | (RefreshToken.token_hash == refresh_token),  # legacy raw tokens
         )
@@ -495,7 +514,7 @@ async def refresh_token(
 
     # Create new refresh token (token rotation)
     new_refresh_token = create_refresh_token(data={"sub": user.email})
-    expires_at = datetime.now() + timedelta(days=7)
+    expires_at = datetime.now(UTC) + timedelta(days=7)
 
     new_refresh_token_record = RefreshToken(
         user_id=user.id,
@@ -511,9 +530,10 @@ async def refresh_token(
         value=new_refresh_token,
         httponly=True,
         secure=_cookie_secure(),
-        samesite="lax",
+        samesite=_cookie_samesite(),
         max_age=settings.refresh_token_expire_days * 24 * 60 * 60,
         domain=_cookie_domain(),
+        path="/",
     )
 
     return TokenResponse(access_token=access_token)
@@ -537,7 +557,7 @@ async def verify_email(
             detail="Invalid or expired verification token",
         )
 
-    if user.email_verification_expires_at < datetime.utcnow():
+    if user.email_verification_expires_at < datetime.now(UTC):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid or expired verification token",
@@ -565,7 +585,7 @@ async def resend_verification(
     if user and not user.is_verified:
         verification_token = generate_verification_token()
         user.email_verification_token_hash = generate_token_hash(verification_token)
-        user.email_verification_expires_at = datetime.utcnow() + timedelta(
+        user.email_verification_expires_at = datetime.now(UTC) + timedelta(
             hours=settings.email_verification_token_expire_hours
         )
         await db.commit()
@@ -600,7 +620,7 @@ async def logout(
     await db.commit()
 
     # Clear refresh token cookie
-    response.delete_cookie(key="refresh_token", domain=_cookie_domain())
+    response.delete_cookie(key="refresh_token", domain=_cookie_domain(), path="/")
 
     return MessageResponse(message="Logged out successfully")
 

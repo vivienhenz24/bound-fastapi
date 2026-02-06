@@ -71,11 +71,11 @@ Parameters:
 
   CookieDomain:
     Type: String
-    Default: ""
+    Default: ".bound.sh"
 
   CookieSecure:
     Type: String
-    Default: "false"
+    Default: "true"
     AllowedValues:
       - "true"
       - "false"
