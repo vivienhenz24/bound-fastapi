@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
     aws_session_token: str = ""
+    aws_profile: str = ""
 
     # TTS Configuration
     max_audio_duration_seconds: int = 3600

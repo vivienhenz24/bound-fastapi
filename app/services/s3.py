@@ -6,6 +6,13 @@ from app.core.config import settings
 
 
 def get_s3_client():
+    if settings.aws_profile:
+        session = boto3.Session(
+            profile_name=settings.aws_profile,
+            region_name=settings.aws_region,
+        )
+        return session.client("s3")
+
     kwargs = {
         "region_name": settings.aws_region,
     }
